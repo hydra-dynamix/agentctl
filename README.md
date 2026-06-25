@@ -45,7 +45,7 @@ handling still works. A failing `cargo test` returns a compact JSON summary:
     "failures:",
     "test result: FAILED. 12 passed; 1 failed"
   ],
-  "raw_log_path": "/home/me/.agentctl/jobs/1780000000-1234-cargo-test/output.log"
+  "raw_log_path": "~/.agentctl/jobs/1780000000-1234-cargo-test/output.log"
 }
 ```
 
@@ -75,8 +75,8 @@ prompt_stdin = false
 command = ["claude", "-p"]
 prompt_stdin = false
 
-# Provider-specific wrappers are external commands. Replace these placeholders
-# with your chosen REST/websocket bridge scripts or binaries.
+# Provider-specific wrappers are external commands. Point these profiles at
+# your chosen REST/websocket bridge scripts or binaries.
 [agents.openai-rest]
 command = ["openai-rest-agent"]
 prompt_stdin = true
@@ -117,7 +117,7 @@ That returns a job record:
   "command": "codex exec --sandbox workspace-write",
   "cwd": "/path/to/project",
   "iterations": 1,
-  "log_path": "/home/me/.agentctl/jobs/1780000000-1234-codex/output.log"
+  "log_path": "~/.agentctl/jobs/1780000000-1234-codex/output.log"
 }
 ```
 
