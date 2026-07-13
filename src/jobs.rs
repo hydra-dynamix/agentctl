@@ -1,15 +1,16 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AgentConfig, CONFIG_DIR, SummaryConfig};
-use crate::exec::{CapturedRun, format_command};
+use crate::exec::{CaptureOptions, CapturedRun, ProcessOptions, format_command, run_captured_with};
+use crate::process::spawn_detached;
 use crate::summary::{Summary, summarize, summarize_with_command};
 
 #[derive(Debug, Clone)]
@@ -71,6 +72,17 @@ struct StoredJobRecord {
     exit_code_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SupervisorSpec {
+    argv: Vec<String>,
+    prompt_stdin: bool,
+    prompt: String,
+    cwd: PathBuf,
+    iterations: u32,
+    exit_code_path: PathBuf,
+    label: String,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ExitRecord {
     exit_code: Option<i32>,
@@ -84,7 +96,7 @@ pub fn run_foreground(
     validate_options(options)?;
     let mut reports = Vec::new();
     for iteration in 1..=options.iterations {
-        let run = run_agent_once(options, iteration)?;
+        let run = run_agent_once(options, summary_config, iteration)?;
         let summary = match &summary_config.summarizer_command {
             Some(command) => summarize_with_command(&run, summary_config, command)
                 .unwrap_or_else(|_| summarize(&run, summary_config)),
@@ -115,40 +127,43 @@ pub fn launch_detached(options: &AgentRunOptions) -> Result<JobRecord> {
     let log_path = job_dir.join("output.log");
     let exit_code_path = job_dir.join("exit-code");
     let job_path = job_dir.join("job.toml");
+    let supervisor_path = job_dir.join("supervisor.toml");
     let stdout = fs::File::create(&log_path)
         .with_context(|| format!("creating agent log {}", log_path.display()))?;
     let stderr = stdout
         .try_clone()
         .with_context(|| format!("cloning agent log {}", log_path.display()))?;
 
-    let script = detached_script(
-        &command_argv(&options.agent, &options.prompt),
-        options.agent.prompt_stdin,
-        options.iterations,
-        &exit_code_path,
-    );
-    let mut command = ProcessCommand::new("bash");
-    command.arg("-lc").arg(script);
+    let argv = command_argv(&options.agent, &options.prompt);
+    let supervisor = SupervisorSpec {
+        argv: argv.clone(),
+        prompt_stdin: options.agent.prompt_stdin,
+        prompt: options.prompt.clone(),
+        cwd: options.cwd.clone(),
+        iterations: options.iterations,
+        exit_code_path: exit_code_path.clone(),
+        label: options.agent_name.clone(),
+    };
+    fs::write(&supervisor_path, toml::to_string_pretty(&supervisor)?)
+        .with_context(|| format!("writing {}", supervisor_path.display()))?;
+
+    let executable = std::env::current_exe().context("locating agentctl executable")?;
+    let mut command = ProcessCommand::new(executable);
+    command.arg("__supervise").arg(&supervisor_path);
     command.current_dir(&options.cwd);
-    command.env("AGENTCTL_AGENT_PROMPT", &options.prompt);
-    command.env("AGENTCTL_AGENT_CWD", &options.cwd);
     command.stdin(Stdio::null());
     command.stdout(Stdio::from(stdout));
     command.stderr(Stdio::from(stderr));
 
-    let child = command.spawn().with_context(|| {
-        format!(
-            "launching detached agent `{}`",
-            format_command(&command_argv(&options.agent, &options.prompt))
-        )
-    })?;
+    let child = spawn_detached(&mut command)
+        .with_context(|| format!("launching detached agent `{}`", format_command(&argv)))?;
 
     let stored = StoredJobRecord {
         id: job_id,
         agent: options.agent_name.clone(),
         pid: child.id(),
         started_at,
-        command: format_command(&command_argv(&options.agent, &options.prompt)),
+        command: format_command(&argv),
         cwd: options.cwd.clone(),
         iterations: options.iterations,
         log_path,
@@ -157,6 +172,54 @@ pub fn launch_detached(options: &AgentRunOptions) -> Result<JobRecord> {
     fs::write(&job_path, toml::to_string_pretty(&stored)?)
         .with_context(|| format!("writing {}", job_path.display()))?;
     record_from_stored(stored)
+}
+
+pub fn supervise(path: &Path) -> Result<i32> {
+    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let spec: SupervisorSpec =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    // The prompt only needs to exist long enough for the detached supervisor
+    // to start. Do not leave the transient spec on disk for completed jobs.
+    let _ = fs::remove_file(path);
+
+    let mut exit_code = 0;
+    for iteration in 1..=spec.iterations {
+        if spec.iterations > 1 {
+            println!(
+                "[iteration {iteration}/{}] {}",
+                spec.iterations,
+                format_command(&spec.argv)
+            );
+        }
+        let capture_options = CaptureOptions {
+            max_output_bytes: 16_384,
+            tail_bytes: 4_096,
+            label: Some(format!("{}-detached-iteration-{iteration}", spec.label)),
+            stream_raw: true,
+        };
+        let process_options = agent_process_options(
+            &spec.cwd,
+            &spec.prompt,
+            spec.prompt_stdin,
+            iteration,
+            spec.iterations,
+        );
+        match run_captured_with(&spec.argv, &capture_options, &process_options) {
+            Ok(run) => {
+                exit_code = exit_status_code(run.exit_status);
+                if exit_code != 0 {
+                    break;
+                }
+            }
+            Err(error) => {
+                eprintln!("agent supervisor failed: {error:#}");
+                exit_code = 1;
+                break;
+            }
+        }
+    }
+    write_exit_record(&spec.exit_code_path, exit_code)?;
+    Ok(exit_code)
 }
 
 pub fn status(job_id: &str, tail: usize) -> Result<JobStatus> {
@@ -210,48 +273,51 @@ pub fn logs(job_id: &str, follow: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_agent_once(options: &AgentRunOptions, iteration: u32) -> Result<CapturedRun> {
+fn run_agent_once(
+    options: &AgentRunOptions,
+    summary_config: &SummaryConfig,
+    iteration: u32,
+) -> Result<CapturedRun> {
     let argv = command_argv(&options.agent, &options.prompt);
-    let raw_log_path =
-        create_job_output_log(&format!("{}-iteration-{iteration}", options.agent_name))?;
-    let start = Instant::now();
-    let mut command = ProcessCommand::new(&argv[0]);
-    command.args(&argv[1..]);
-    command.current_dir(&options.cwd);
-    command.env("AGENTCTL_AGENT_PROMPT", &options.prompt);
-    command.env("AGENTCTL_AGENT_CWD", &options.cwd);
-    command.env("AGENTCTL_AGENT_ITERATION", iteration.to_string());
-    command.env("AGENTCTL_AGENT_ITERATIONS", options.iterations.to_string());
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if options.agent.prompt_stdin {
-        command.stdin(Stdio::piped());
+    let capture_options = CaptureOptions {
+        max_output_bytes: summary_config.max_output_bytes,
+        tail_bytes: summary_config.tail_bytes,
+        label: Some(format!("{}-iteration-{iteration}", options.agent_name)),
+        stream_raw: false,
+    };
+    let process_options = agent_process_options(
+        &options.cwd,
+        &options.prompt,
+        options.agent.prompt_stdin,
+        iteration,
+        options.iterations,
+    );
+    run_captured_with(&argv, &capture_options, &process_options)
+}
+
+fn agent_process_options(
+    cwd: &Path,
+    prompt: &str,
+    prompt_stdin: bool,
+    iteration: u32,
+    iterations: u32,
+) -> ProcessOptions {
+    ProcessOptions {
+        cwd: Some(cwd.to_path_buf()),
+        env: vec![
+            ("AGENTCTL_AGENT_PROMPT".into(), prompt.into()),
+            ("AGENTCTL_AGENT_CWD".into(), cwd.as_os_str().to_owned()),
+            (
+                "AGENTCTL_AGENT_ITERATION".into(),
+                iteration.to_string().into(),
+            ),
+            (
+                "AGENTCTL_AGENT_ITERATIONS".into(),
+                iterations.to_string().into(),
+            ),
+        ],
+        stdin: prompt_stdin.then(|| prompt.as_bytes().to_vec()),
     }
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("launching agent `{}`", format_command(&argv)))?;
-    if options.agent.prompt_stdin
-        && let Some(mut stdin) = child.stdin.take()
-    {
-        stdin
-            .write_all(options.prompt.as_bytes())
-            .context("writing prompt to agent stdin")?;
-    }
-
-    let output = child.wait_with_output().context("waiting for agent")?;
-    let elapsed = start.elapsed();
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    persist_raw_log(&raw_log_path, &stdout, &stderr)?;
-
-    Ok(CapturedRun {
-        command: argv,
-        exit_status: output.status,
-        elapsed,
-        stdout,
-        stderr,
-        raw_log_path,
-    })
 }
 
 fn validate_options(options: &AgentRunOptions) -> Result<()> {
@@ -273,38 +339,6 @@ fn command_argv(agent: &AgentConfig, prompt: &str) -> Vec<String> {
         argv.push(prompt.to_owned());
     }
     argv
-}
-
-fn detached_script(
-    argv: &[String],
-    prompt_stdin: bool,
-    iterations: u32,
-    exit_code_path: &Path,
-) -> String {
-    let command = shell_command(argv);
-    let display = shell_single_quote(&format_command(argv));
-    let exit_code_path = shell_single_quote(&exit_code_path.display().to_string());
-    let invoke = if prompt_stdin {
-        format!(
-            "printf '%s' \"$AGENTCTL_AGENT_PROMPT\" | AGENTCTL_AGENT_ITERATION=\"$iteration\" {command}"
-        )
-    } else {
-        format!("AGENTCTL_AGENT_ITERATION=\"$iteration\" {command}")
-    };
-    format!(
-        "status=0; for iteration in $(seq 1 {iterations}); do if [ {iterations} -gt 1 ]; then printf '[iteration %s/{iterations}] %s\\n' \"$iteration\" {display}; fi; {invoke}; status=$?; if [ $status -ne 0 ]; then break; fi; done; finished_at=$(date +%s); {{ printf '%s\\n' \"$status\"; printf 'finished_at=%s\\n' \"$finished_at\"; }} > {exit_code_path}; exit $status"
-    )
-}
-
-fn shell_command(argv: &[String]) -> String {
-    argv.iter()
-        .map(|argument| shell_single_quote(argument))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn record_from_stored(stored: StoredJobRecord) -> Result<JobRecord> {
@@ -352,6 +386,29 @@ fn read_exit_record(path: &Path) -> Result<ExitRecord> {
     })
 }
 
+fn write_exit_record(path: &Path, exit_code: i32) -> Result<()> {
+    let finished_at = unix_timestamp()?;
+    fs::write(path, format!("{exit_code}\nfinished_at={finished_at}\n"))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+fn exit_status_code(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(|signal| 128 + signal).unwrap_or(1)
+    }
+
+    #[cfg(not(unix))]
+    {
+        1
+    }
+}
+
 fn read_job(job_id: &str) -> Result<StoredJobRecord> {
     read_job_path(&jobs_dir()?.join(job_id).join("job.toml"))
 }
@@ -376,35 +433,6 @@ fn read_tail_lines(path: &Path, tail: usize) -> Result<Vec<String>> {
 fn jobs_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     Ok(PathBuf::from(home).join(CONFIG_DIR).join("jobs"))
-}
-
-fn create_job_output_log(label: &str) -> Result<PathBuf> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = jobs_dir()?.join(format!("{}-{}", timestamp, safe_name(label)));
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir.join("output.log"))
-}
-
-fn persist_raw_log(path: &Path, stdout: &str, stderr: &str) -> Result<()> {
-    let mut raw = String::new();
-    if !stdout.is_empty() {
-        raw.push_str("stdout:\n");
-        raw.push_str(stdout);
-        if !stdout.ends_with('\n') {
-            raw.push('\n');
-        }
-    }
-    if !stderr.is_empty() {
-        raw.push_str("stderr:\n");
-        raw.push_str(stderr);
-        if !stderr.ends_with('\n') {
-            raw.push('\n');
-        }
-    }
-    fs::write(path, raw).with_context(|| format!("writing {}", path.display()))
 }
 
 fn job_id(started_at: u64, agent_name: &str) -> String {

@@ -174,6 +174,87 @@ fn detached_trivial_agent_round_trips_run_status_logs() {
 }
 
 #[test]
+#[cfg(unix)]
+fn detached_supervisor_reaps_descendants_that_create_a_new_session() {
+    let home_dir = tempfile::tempdir().expect("home tempdir");
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let descendant_pid_path = project_dir.path().join("detached-descendant.pid");
+    std::fs::write(
+        project_dir.path().join("agentctl.toml"),
+        format!(
+            r#"
+[summary]
+max_output_bytes = 1024
+tail_bytes = 256
+max_preview_lines = 12
+
+[agents.detached_tree]
+command = ["bash", "-c", "setsid sleep 30 & echo $! > '{}'; exit 0"]
+prompt_stdin = false
+"#,
+            descendant_pid_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let run_output = Command::cargo_bin("agentctl")
+        .expect("agentctl binary")
+        .current_dir(project_dir.path())
+        .env("HOME", home_dir.path())
+        .args([
+            "run",
+            "detached_tree",
+            "--prompt",
+            "test",
+            "--detach",
+            "--json",
+        ])
+        .output()
+        .expect("run detached process tree");
+    assert!(run_output.status.success());
+    let run_json: Value = serde_json::from_slice(&run_output.stdout).expect("run json");
+    let job_id = run_json["id"].as_str().expect("job id");
+
+    let mut succeeded = false;
+    for _ in 0..100 {
+        let status_output = Command::cargo_bin("agentctl")
+            .expect("agentctl binary")
+            .current_dir(project_dir.path())
+            .env("HOME", home_dir.path())
+            .args(["status", job_id, "--json"])
+            .output()
+            .expect("status detached process tree");
+        let status: Value = serde_json::from_slice(&status_output.stdout).expect("status json");
+        if status["record"]["state"] == "succeeded" {
+            succeeded = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(succeeded, "detached supervisor did not record success");
+
+    let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+        .expect("detached descendant pid")
+        .trim()
+        .parse::<i32>()
+        .expect("numeric detached descendant pid");
+    let descendant_exists = unsafe { libc::kill(descendant_pid, 0) } == 0;
+    assert!(
+        !descendant_exists,
+        "detached descendant {descendant_pid} survived its supervisor"
+    );
+    assert!(
+        !home_dir
+            .path()
+            .join(".agentctl/jobs")
+            .join(job_id)
+            .join("supervisor.toml")
+            .exists(),
+        "transient supervisor spec should be removed"
+    );
+}
+
+#[test]
 fn dead_pid_without_exit_code_is_stale() {
     let home_dir = tempfile::tempdir().expect("home tempdir");
     let project_dir = tempfile::tempdir().expect("project tempdir");
@@ -255,6 +336,66 @@ fn foreground_agent_accepts_prompt_file_and_cwd_override() {
         reports[0]["summary"]["preview_lines"]
             .to_string()
             .contains("from-file")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn terminating_foreground_agentctl_terminates_and_reaps_the_agent_tree() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let home_dir = tempfile::tempdir().expect("home tempdir");
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    let descendant_pid_path = project_dir.path().join("descendant.pid");
+    std::fs::write(
+        project_dir.path().join("agentctl.toml"),
+        format!(
+            r#"
+[summary]
+max_output_bytes = 1024
+tail_bytes = 256
+max_preview_lines = 12
+
+[agents.tree]
+command = ["bash", "-c", "setsid sleep 30 & echo $! > '{}'; wait"]
+prompt_stdin = false
+"#,
+            descendant_pid_path.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut agentctl = std::process::Command::new(assert_cmd::cargo::cargo_bin!("agentctl"))
+        .current_dir(project_dir.path())
+        .env("HOME", home_dir.path())
+        .args(["run", "tree", "--prompt", "test"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn foreground agentctl");
+
+    for _ in 0..100 {
+        if descendant_pid_path.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+        .expect("descendant pid")
+        .trim()
+        .parse::<i32>()
+        .expect("numeric descendant pid");
+
+    let signal_result = unsafe { libc::kill(agentctl.id() as i32, libc::SIGTERM) };
+    assert_eq!(signal_result, 0, "signal foreground agentctl");
+    let status = agentctl.wait().expect("wait for foreground agentctl");
+    assert!(!status.success());
+    assert!(status.code().is_some() || status.signal().is_some());
+
+    let descendant_exists = unsafe { libc::kill(descendant_pid, 0) } == 0;
+    assert!(
+        !descendant_exists,
+        "agent descendant {descendant_pid} survived agentctl termination"
     );
 }
 

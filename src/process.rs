@@ -1,0 +1,306 @@
+use std::io;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::sync::OnceLock;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicI32, Ordering};
+
+#[cfg(unix)]
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+#[cfg(unix)]
+use signal_hook::iterator::Signals;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+const TERMINATION_GRACE: Duration = Duration::from_millis(750);
+
+#[cfg(unix)]
+static ACTIVE_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
+#[cfg(unix)]
+static SIGNAL_FORWARDER: OnceLock<()> = OnceLock::new();
+
+/// A child that owns an isolated process group. Waiting for the command also
+/// terminates descendants which outlive their group leader. Dropping it on an
+/// error follows the same TERM-then-KILL cleanup path and always reaps the
+/// direct child.
+pub(crate) struct ManagedChild {
+    child: Child,
+    #[cfg(unix)]
+    process_group: i32,
+    reaped: bool,
+}
+
+/// Spawn a detached supervisor as its own process-group leader. The supervisor
+/// is responsible for recording completion and terminating its group.
+pub(crate) fn spawn_detached(command: &mut Command) -> io::Result<Child> {
+    configure_process_group(command);
+    command.spawn()
+}
+
+impl ManagedChild {
+    pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
+        enable_subreaper()?;
+        configure_process_group(command);
+        install_signal_forwarder()?;
+        let child = command.spawn()?;
+
+        #[cfg(unix)]
+        {
+            let process_group = child.id() as i32;
+            ACTIVE_PROCESS_GROUP.store(process_group, Ordering::SeqCst);
+            Ok(Self {
+                child,
+                process_group,
+                reaped: false,
+            })
+        }
+
+        #[cfg(not(unix))]
+        Ok(Self {
+            child,
+            reaped: false,
+        })
+    }
+
+    pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child.wait()?;
+        self.reaped = true;
+        self.clean_remaining_descendants();
+        self.clear_active_group();
+        Ok(status)
+    }
+
+    fn clean_remaining_descendants(&self) {
+        #[cfg(unix)]
+        terminate_process_tree(self.process_group);
+    }
+
+    fn clear_active_group(&self) {
+        #[cfg(unix)]
+        {
+            let _ = ACTIVE_PROCESS_GROUP.compare_exchange(
+                self.process_group,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+
+        #[cfg(unix)]
+        terminate_process_tree(self.process_group);
+        #[cfg(not(unix))]
+        let _ = self.child.kill();
+
+        let _ = self.child.wait();
+        self.reaped = true;
+        self.clear_active_group();
+    }
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn install_signal_forwarder() -> io::Result<()> {
+    if SIGNAL_FORWARDER.get().is_some() {
+        return Ok(());
+    }
+
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
+    SIGNAL_FORWARDER.get_or_init(|| {
+        std::thread::spawn(move || {
+            for signal in signals.forever() {
+                let process_group = ACTIVE_PROCESS_GROUP.load(Ordering::SeqCst);
+                if process_group > 0 {
+                    // Negative PIDs address the complete process group.
+                    unsafe {
+                        libc::kill(-process_group, signal);
+                    }
+                } else {
+                    // Do not turn agentctl into a process that ignores Ctrl-C
+                    // while no managed child is active.
+                    let _ = signal_hook::low_level::emulate_default_handler(signal);
+                }
+            }
+        });
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn enable_subreaper() -> io::Result<()> {
+    let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_subreaper() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_signal_forwarder() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(process_group: i32) {
+    if process_group <= 0 {
+        return;
+    }
+
+    unsafe {
+        libc::kill(-process_group, SIGTERM);
+    }
+    signal_adopted_descendants(SIGTERM);
+    let deadline = Instant::now() + TERMINATION_GRACE;
+    while Instant::now() < deadline {
+        reap_adopted_children();
+        signal_adopted_descendants(SIGTERM);
+        if !process_tree_exists(process_group) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+    signal_adopted_descendants(libc::SIGKILL);
+    let kill_deadline = Instant::now() + TERMINATION_GRACE;
+    while Instant::now() < kill_deadline {
+        reap_adopted_children();
+        signal_adopted_descendants(libc::SIGKILL);
+        if !process_tree_exists(process_group) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    reap_adopted_children();
+}
+
+#[cfg(unix)]
+fn process_tree_exists(process_group: i32) -> bool {
+    process_group_exists(process_group) || adopted_children_exist()
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group: i32) -> bool {
+    let result = unsafe { libc::kill(-process_group, 0) };
+    if result == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "linux")]
+fn reap_adopted_children() {
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if result <= 0 {
+            break;
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn reap_adopted_children() {}
+
+#[cfg(target_os = "linux")]
+fn adopted_children_exist() -> bool {
+    !linux_child_pids(std::process::id() as i32).is_empty()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn adopted_children_exist() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn signal_adopted_descendants(signal: i32) {
+    let mut pending = linux_child_pids(std::process::id() as i32);
+    while let Some(pid) = pending.pop() {
+        pending.extend(linux_child_pids(pid));
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn signal_adopted_descendants(_signal: i32) {}
+
+#[cfg(target_os = "linux")]
+fn linux_child_pids(pid: i32) -> Vec<i32> {
+    let path = format!("/proc/{pid}/task/{pid}/children");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|value| value.parse().ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Stdio;
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_terminates_descendants_left_by_the_direct_child() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("descendant.pid");
+        let script = format!(
+            "setsid sleep 30 & printf '%s' $! > '{}'; exit 0",
+            pid_path.display()
+        );
+        let mut command = Command::new("bash");
+        command
+            .args(["-c", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = ManagedChild::spawn(&mut command).expect("spawn managed child");
+        let status = child.wait().expect("wait managed child");
+        assert!(status.success());
+
+        let pid = std::fs::read_to_string(pid_path)
+            .expect("descendant pid")
+            .parse::<i32>()
+            .expect("numeric pid");
+        let running = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!running, "descendant {pid} survived its agent command");
+    }
+}
