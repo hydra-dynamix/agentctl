@@ -8,4 +8,5 @@ pub mod config;
 pub mod exec;
 pub mod jobs;
 pub mod output;
+mod process;
 pub mod summary;

@@ -56,6 +56,8 @@ enum Command {
         #[arg(long)]
         follow: bool,
     },
+    #[command(name = "__supervise", hide = true)]
+    Supervise { spec: PathBuf },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -187,6 +189,10 @@ fn main() -> Result<()> {
         }
         Command::Logs { job_id, follow } => {
             agentctl::jobs::logs(&job_id, follow)?;
+        }
+        Command::Supervise { spec } => {
+            let exit_code = agentctl::jobs::supervise(&spec)?;
+            std::process::exit(exit_code);
         }
         Command::Config { command } => match command {
             ConfigCommand::Generate => {

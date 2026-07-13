@@ -52,6 +52,13 @@ handling still works. A failing `cargo test` returns a compact JSON summary:
 The full stdout and stderr remain in `raw_log_path` for later inspection. Use
 `--raw` when you deliberately want the untouched command output streamed back.
 
+Output is streamed to the raw log while only the configured head/tail window is
+retained in memory. Agent commands run in an isolated process group. Interrupting
+agentctl forwards the signal to the complete command tree, waits for it, and
+terminates descendants left behind by a command that exits early. On Linux,
+agentctl also adopts and reaps orphaned descendants so repeated tool loops do not
+accumulate zombie or live background agent processes.
+
 ## Run a detached agent task
 
 Configure agents in TOML:
@@ -131,6 +138,9 @@ agentctl list --json
 
 `logs` is intentionally the raw-output command. `status` and `list` stay bounded
 and machine-readable for agent loops.
+
+Detached supervisors also run in an isolated process group and terminate the
+remaining group after recording their exit status.
 
 ## JSON contract
 
