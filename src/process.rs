@@ -31,6 +31,8 @@ use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_P
 
 #[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_millis(750);
+#[cfg(unix)]
+const PROCESS_GROUP_STARTING: i32 = -1;
 
 #[cfg(unix)]
 static ACTIVE_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
@@ -67,13 +69,33 @@ impl ManagedChild {
         enable_subreaper()?;
         configure_process_group(command);
         install_signal_forwarder()?;
-        let child = command.spawn()?;
+        #[cfg(unix)]
+        {
+            FORWARDED_SIGNAL.store(0, Ordering::SeqCst);
+            ACTIVE_PROCESS_GROUP.store(PROCESS_GROUP_STARTING, Ordering::SeqCst);
+        }
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                #[cfg(unix)]
+                {
+                    ACTIVE_PROCESS_GROUP.store(0, Ordering::SeqCst);
+                    FORWARDED_SIGNAL.store(0, Ordering::SeqCst);
+                }
+                return Err(error);
+            }
+        };
 
         #[cfg(unix)]
         {
             let process_group = child.id() as i32;
-            FORWARDED_SIGNAL.store(0, Ordering::SeqCst);
             ACTIVE_PROCESS_GROUP.store(process_group, Ordering::SeqCst);
+            let pending_signal = FORWARDED_SIGNAL.load(Ordering::SeqCst);
+            if pending_signal > 0 {
+                unsafe {
+                    libc::kill(-process_group, pending_signal);
+                }
+            }
             Ok(Self {
                 child,
                 process_group,
@@ -237,19 +259,24 @@ fn install_signal_forwarder() -> io::Result<()> {
         std::thread::spawn(move || {
             for signal in signals.forever() {
                 let process_group = ACTIVE_PROCESS_GROUP.load(Ordering::SeqCst);
-                if process_group > 0 {
+                if process_group != 0 {
                     // Preserve the first interruption so the foreground caller
                     // cannot report success merely because its child handled
-                    // the forwarded signal and returned zero.
+                    // the forwarded signal and returned zero. A negative value
+                    // means spawn is in progress; reloading after recording the
+                    // signal closes the registration race with the parent.
                     let _ = FORWARDED_SIGNAL.compare_exchange(
                         0,
                         signal,
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                     );
-                    // Negative PIDs address the complete process group.
-                    unsafe {
-                        libc::kill(-process_group, signal);
+                    let registered_group = ACTIVE_PROCESS_GROUP.load(Ordering::SeqCst);
+                    if registered_group > 0 {
+                        // Negative PIDs address the complete process group.
+                        unsafe {
+                            libc::kill(-registered_group, signal);
+                        }
                     }
                 } else {
                     // Do not turn agentctl into a process that ignores Ctrl-C
