@@ -11,7 +11,7 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::Signals;
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
@@ -34,6 +34,8 @@ const TERMINATION_GRACE: Duration = Duration::from_millis(750);
 
 #[cfg(unix)]
 static ACTIVE_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
+#[cfg(unix)]
+static FORWARDED_SIGNAL: AtomicI32 = AtomicI32::new(0);
 #[cfg(unix)]
 static SIGNAL_FORWARDER: OnceLock<()> = OnceLock::new();
 
@@ -70,6 +72,7 @@ impl ManagedChild {
         #[cfg(unix)]
         {
             let process_group = child.id() as i32;
+            FORWARDED_SIGNAL.store(0, Ordering::SeqCst);
             ACTIVE_PROCESS_GROUP.store(process_group, Ordering::SeqCst);
             Ok(Self {
                 child,
@@ -120,6 +123,15 @@ impl ManagedChild {
         self.reaped = true;
         self.clean_remaining_descendants();
         self.clear_active_group();
+
+        #[cfg(unix)]
+        {
+            let signal = FORWARDED_SIGNAL.swap(0, Ordering::SeqCst);
+            if signal > 0 {
+                return Ok(ExitStatus::from_raw(signal));
+            }
+        }
+
         Ok(status)
     }
 
@@ -226,6 +238,15 @@ fn install_signal_forwarder() -> io::Result<()> {
             for signal in signals.forever() {
                 let process_group = ACTIVE_PROCESS_GROUP.load(Ordering::SeqCst);
                 if process_group > 0 {
+                    // Preserve the first interruption so the foreground caller
+                    // cannot report success merely because its child handled
+                    // the forwarded signal and returned zero.
+                    let _ = FORWARDED_SIGNAL.compare_exchange(
+                        0,
+                        signal,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
                     // Negative PIDs address the complete process group.
                     unsafe {
                         libc::kill(-process_group, signal);
