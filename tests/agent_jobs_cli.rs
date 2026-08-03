@@ -403,7 +403,7 @@ tail_bytes = 256
 max_preview_lines = 12
 
 [agents.tree]
-command = ["bash", "-c", "setsid sleep 30 & echo $! > '{}'; wait"]
+command = ["bash", "-c", "trap 'exit 143' TERM; setsid sleep 30 & echo $! > '{}'; while :; do sleep 1; done"]
 prompt_stdin = false
 "#,
             descendant_pid_path.display()
@@ -432,6 +432,13 @@ prompt_stdin = false
         .parse::<i32>()
         .expect("numeric descendant pid");
 
+    assert!(
+        agentctl
+            .try_wait()
+            .expect("check foreground agentctl")
+            .is_none(),
+        "foreground agentctl exited before it could be signaled"
+    );
     let signal_result = unsafe { libc::kill(agentctl.id() as i32, libc::SIGTERM) };
     assert_eq!(signal_result, 0, "signal foreground agentctl");
     let status = agentctl.wait().expect("wait for foreground agentctl");
