@@ -4,7 +4,14 @@ use serde_json::Value;
 fn write_agent_config(project_dir: &tempfile::TempDir) {
     std::fs::write(
         project_dir.path().join("agentctl.toml"),
-        r#"
+        platform_agent_config(),
+    )
+    .expect("write config");
+}
+
+#[cfg(unix)]
+fn platform_agent_config() -> &'static str {
+    r#"
 [summary]
 max_output_bytes = 16384
 tail_bytes = 4096
@@ -17,18 +24,30 @@ prompt_stdin = false
 [agents.stdin_loop]
 command = ["bash", "-c", "prompt=$(cat); echo prompt=$prompt; echo iteration=$AGENTCTL_AGENT_ITERATION"]
 prompt_stdin = true
-"#,
-    )
-    .expect("write config");
+"#
 }
 
-#[test]
-fn run_defaults_to_codex_and_reads_prompt_from_stdin() {
-    let home_dir = tempfile::tempdir().expect("home tempdir");
-    let project_dir = tempfile::tempdir().expect("project tempdir");
-    std::fs::write(
-        project_dir.path().join("agentctl.toml"),
-        r#"
+#[cfg(windows)]
+fn platform_agent_config() -> &'static str {
+    r#"
+[summary]
+max_output_bytes = 16384
+tail_bytes = 4096
+max_preview_lines = 12
+
+[agents.trivial]
+command = ["cmd", "/C", "echo done"]
+prompt_stdin = false
+
+[agents.stdin_loop]
+command = ["cmd", "/V:ON", "/C", "set /p prompt=& echo prompt=!prompt!& echo iteration=!AGENTCTL_AGENT_ITERATION!"]
+prompt_stdin = true
+"#
+}
+
+#[cfg(unix)]
+fn default_codex_test_config() -> &'static str {
+    r#"
 [summary]
 max_output_bytes = 16384
 tail_bytes = 4096
@@ -37,7 +56,30 @@ max_preview_lines = 12
 [agents.codex]
 command = ["bash", "-c", "prompt=$(cat); echo default-codex=$prompt"]
 prompt_stdin = true
-"#,
+"#
+}
+
+#[cfg(windows)]
+fn default_codex_test_config() -> &'static str {
+    r#"
+[summary]
+max_output_bytes = 16384
+tail_bytes = 4096
+max_preview_lines = 12
+
+[agents.codex]
+command = ["cmd", "/V:ON", "/C", "set /p prompt=& echo default-codex=!prompt!"]
+prompt_stdin = true
+"#
+}
+
+#[test]
+fn run_defaults_to_codex_and_reads_prompt_from_stdin() {
+    let home_dir = tempfile::tempdir().expect("home tempdir");
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    std::fs::write(
+        project_dir.path().join("agentctl.toml"),
+        default_codex_test_config(),
     )
     .expect("write config");
 
@@ -281,9 +323,9 @@ iterations = 1
 log_path = "{}"
 exit_code_path = "{}"
 "#,
-            project_dir.path().display(),
-            log_path.display(),
-            exit_code_path.display()
+            toml_path(project_dir.path()),
+            toml_path(&log_path),
+            toml_path(&exit_code_path)
         ),
     )
     .expect("job record");
@@ -300,6 +342,10 @@ exit_code_path = "{}"
     let json: Value = serde_json::from_slice(&output.stdout).expect("status json");
     assert_status_schema(&json);
     assert_eq!(json["record"]["state"], "stale");
+}
+
+fn toml_path(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
 }
 
 #[test]
@@ -357,7 +403,7 @@ tail_bytes = 256
 max_preview_lines = 12
 
 [agents.tree]
-command = ["bash", "-c", "setsid sleep 30 & echo $! > '{}'; wait"]
+command = ["bash", "-c", "trap 'exit 143' TERM; setsid sleep 30 & echo $! > '{}'; while :; do sleep 1; done"]
 prompt_stdin = false
 "#,
             descendant_pid_path.display()
@@ -386,6 +432,13 @@ prompt_stdin = false
         .parse::<i32>()
         .expect("numeric descendant pid");
 
+    assert!(
+        agentctl
+            .try_wait()
+            .expect("check foreground agentctl")
+            .is_none(),
+        "foreground agentctl exited before it could be signaled"
+    );
     let signal_result = unsafe { libc::kill(agentctl.id() as i32, libc::SIGTERM) };
     assert_eq!(signal_result, 0, "signal foreground agentctl");
     let status = agentctl.wait().expect("wait for foreground agentctl");

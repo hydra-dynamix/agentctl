@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use crate::config::CONFIG_DIR;
+use crate::platform;
 use crate::process::ManagedChild;
 #[derive(Debug, Clone)]
 pub struct CaptureOptions {
@@ -65,6 +66,7 @@ pub(crate) fn run_captured_with(
     if process_options.stdin.is_some() {
         command.stdin(Stdio::piped());
     }
+    platform::configure_child_home(&mut command)?;
 
     let mut child = ManagedChild::spawn(&mut command)
         .with_context(|| format!("executing `{}`", format_command(argv)))?;
@@ -261,8 +263,7 @@ fn create_raw_log_path(label: Option<&str>) -> Result<PathBuf> {
 }
 
 fn home_jobs_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(CONFIG_DIR).join("jobs"))
+    Ok(platform::home_dir()?.join(CONFIG_DIR).join("jobs"))
 }
 
 fn job_id(label: Option<&str>) -> String {

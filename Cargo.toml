@@ -1,6 +1,6 @@
 [package]
 name = "agentctl"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "Compact, bounded command and agent reports for LLM tool loops"
@@ -13,13 +13,24 @@ exclude = [".ldgr/", "docs/"]
 [dependencies]
 anyhow = "1.0.98"
 clap = { version = "4.5.40", features = ["derive"] }
+getrandom = "0.2.16"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+semver = "1.0.26"
+sha2 = "0.10.9"
 toml = "0.8.23"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"
 signal-hook = "0.3.18"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 assert_cmd = "2.0.17"

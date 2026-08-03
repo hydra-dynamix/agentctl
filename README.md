@@ -24,6 +24,43 @@ agentctl config check
 `~/.agentctl/config.toml`. Raw command logs and detached job records live under
 `~/.agentctl/jobs/`.
 
+Inspect the current platform, home-directory resolution, LDGR harness
+selection, configured agents, and commands actually available on `PATH`:
+
+```sh
+agentctl discover
+agentctl discover --json
+```
+
+For an `ldgr-loop` or `ldgr-summary` profile, agentctl negotiates
+`ldgr.launcher-compatibility.v1` before reading worker output or starting the
+agent. Agentctl 0.1.2 requires LDGR Core `>=0.1.13, <0.2.0`. An older or mixed
+Core is rejected with a durable `agentctl.compatibility/core-incompatible`
+recovery record and exact upgrade/rollback commands. Install both executables
+from the same LDGR Core release bundle.
+
+Agentctl works with `HOME` on Unix, macOS, WSL, and Windows environments that
+provide it. Native Windows also falls back to `USERPROFILE`, then
+`HOMEDRIVE` + `HOMEPATH`; `AGENTCTL_HOME` is an explicit final configuration
+override for unusual service or test environments. A synthesized home is
+passed to child harnesses as `HOME`.
+
+`ldgr install` records its ordered harness selection in
+`~/.ldgr/config.toml`. Agentctl also reads the older
+`~/.ldgr/config.json` during migration. Resolution order is:
+
+1. an explicit `agentctl run <agent>` profile;
+2. a runnable generic `ldgr-loop` profile;
+3. the first runnable profile among LDGR's default and selected harnesses;
+4. for an agent omitted on the command line, another runnable configured
+   profile.
+
+An unavailable explicit non-LDGR profile never silently changes providers.
+When the generic LDGR profile is stale, Agentctl can use the next selected
+harness and prints the decision to stderr. Pass `--no-fallback` to disable that
+behavior. Failures list the detected platform, config source, selected
+harnesses, runnable alternatives, and repair commands.
+
 ## Wrap a noisy command
 
 Use `exec` when an agent wants to run a command but should receive only the
@@ -57,7 +94,10 @@ retained in memory. Agent commands run in an isolated process group. Interruptin
 agentctl forwards the signal to the complete command tree, waits for it, and
 terminates descendants left behind by a command that exits early. On Linux,
 agentctl also adopts and reaps orphaned descendants so repeated tool loops do not
-accumulate zombie or live background agent processes.
+accumulate zombie or live background agent processes. Native Windows commands
+are assigned to kill-on-close Job Objects, detached supervisors use a detached
+process group, and job status uses native process handles rather than Unix
+utilities.
 
 ## Run a detached agent task
 
@@ -72,6 +112,10 @@ max_preview_lines = 12
 [agents.codex]
 command = ["codex", "exec", "--sandbox", "workspace-write"]
 prompt_stdin = true
+
+[agents.pi]
+command = ["pi", "-p"]
+prompt_stdin = false
 
 [agents.claude-code]
 command = ["claude", "-p"]
@@ -95,6 +139,14 @@ prompt_stdin = true
 [agents.ollama]
 command = ["ollama", "run", "llama3"]
 prompt_stdin = true
+
+[agents.openclaw]
+command = ["openclaw", "run"]
+prompt_stdin = false
+
+[agents.opencode]
+command = ["opencode", "run"]
+prompt_stdin = false
 ```
 
 Start a long task without keeping the caller attached:
@@ -106,7 +158,8 @@ agentctl run codex \
   --detach \
   --json
 
-# codex is the default agent, and stdin is accepted as the prompt:
+# With no explicit profile, Agentctl uses the valid LDGR selection when
+# available and otherwise prefers codex. Stdin is accepted as the prompt:
 printf 'Run cargo test and summarize the result.' | agentctl run --json
 ```
 
