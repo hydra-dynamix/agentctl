@@ -1,6 +1,5 @@
 use std::io;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
-use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::sync::OnceLock;
@@ -13,7 +12,24 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::Signals;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
 
+#[cfg(unix)]
 const TERMINATION_GRACE: Duration = Duration::from_millis(750);
 
 #[cfg(unix)]
@@ -29,12 +45,17 @@ pub(crate) struct ManagedChild {
     child: Child,
     #[cfg(unix)]
     process_group: i32,
+    #[cfg(windows)]
+    job: HANDLE,
     reaped: bool,
 }
 
 /// Spawn a detached supervisor as its own process-group leader. The supervisor
 /// is responsible for recording completion and terminating its group.
 pub(crate) fn spawn_detached(command: &mut Command) -> io::Result<Child> {
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    #[cfg(not(windows))]
     configure_process_group(command);
     command.spawn()
 }
@@ -57,7 +78,25 @@ impl ManagedChild {
             })
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let mut child = child;
+            let job = match create_kill_on_close_job(&child) {
+                Ok(job) => job,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            Ok(Self {
+                child,
+                job,
+                reaped: false,
+            })
+        }
+
+        #[cfg(not(any(unix, windows)))]
         Ok(Self {
             child,
             reaped: false,
@@ -84,9 +123,17 @@ impl ManagedChild {
         Ok(status)
     }
 
-    fn clean_remaining_descendants(&self) {
+    fn clean_remaining_descendants(&mut self) {
         #[cfg(unix)]
         terminate_process_tree(self.process_group);
+        #[cfg(windows)]
+        if !self.job.is_null() {
+            unsafe {
+                TerminateJobObject(self.job, 1);
+                CloseHandle(self.job);
+            }
+            self.job = std::ptr::null_mut();
+        }
     }
 
     fn clear_active_group(&self) {
@@ -108,9 +155,8 @@ impl Drop for ManagedChild {
             return;
         }
 
-        #[cfg(unix)]
-        terminate_process_tree(self.process_group);
-        #[cfg(not(unix))]
+        self.clean_remaining_descendants();
+        #[cfg(not(any(unix, windows)))]
         let _ = self.child.kill();
 
         let _ = self.child.wait();
@@ -125,7 +171,48 @@ fn configure_process_group(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
+fn configure_process_group(command: &mut Command) {
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
+#[cfg(windows)]
+fn create_kill_on_close_job(child: &Child) -> io::Result<HANDLE> {
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            CloseHandle(job);
+        }
+        return Err(error);
+    }
+
+    let process = child.as_raw_handle() as HANDLE;
+    if unsafe { AssignProcessToJobObject(job, process) } == 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            CloseHandle(job);
+        }
+        return Err(error);
+    }
+    Ok(job)
+}
 
 #[cfg(unix)]
 fn install_signal_forwarder() -> io::Result<()> {
@@ -272,7 +359,7 @@ fn linux_child_pids(pid: i32) -> Vec<i32> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::process::Stdio;
@@ -302,5 +389,56 @@ mod tests {
             .expect("numeric pid");
         let running = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!running, "descendant {pid} survived its agent command");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::process::Stdio;
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    #[test]
+    fn wait_terminates_descendants_in_the_windows_job_object() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("descendant.pid");
+        let escaped_path = pid_path.display().to_string().replace('\'', "''");
+        let script = format!(
+            "$child = Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep 30' -PassThru; Set-Content -NoNewline -LiteralPath '{escaped_path}' -Value $child.Id"
+        );
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-Command", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = ManagedChild::spawn(&mut command).expect("spawn managed child");
+        let status = child.wait().expect("wait managed child");
+        assert!(status.success());
+
+        let pid = std::fs::read_to_string(pid_path)
+            .expect("descendant pid")
+            .parse::<u32>()
+            .expect("numeric pid");
+        assert!(
+            !process_is_running(pid),
+            "descendant {pid} survived its Windows job object"
+        );
+    }
+
+    fn process_is_running(pid: u32) -> bool {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0;
+        let success = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+        unsafe {
+            CloseHandle(handle);
+        }
+        success && exit_code == STILL_ACTIVE as u32
     }
 }

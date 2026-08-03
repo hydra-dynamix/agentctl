@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::platform;
 
 pub const PROJECT_CONFIG_FILE: &str = "agentctl.toml";
 pub const CONFIG_DIR: &str = ".agentctl";
@@ -43,6 +45,14 @@ pub struct LoadedConfig {
 impl Default for Config {
     fn default() -> Self {
         let mut agents = BTreeMap::new();
+        agents.insert(
+            "pi".to_owned(),
+            AgentConfig {
+                command: vec!["pi".to_owned(), "-p".to_owned()],
+                prompt_stdin: false,
+                cwd: None,
+            },
+        );
         agents.insert(
             "codex".to_owned(),
             AgentConfig {
@@ -89,6 +99,22 @@ impl Default for Config {
             },
         );
         agents.insert(
+            "openclaw".to_owned(),
+            AgentConfig {
+                command: vec!["openclaw".to_owned(), "run".to_owned()],
+                prompt_stdin: false,
+                cwd: None,
+            },
+        );
+        agents.insert(
+            "opencode".to_owned(),
+            AgentConfig {
+                command: vec!["opencode".to_owned(), "run".to_owned()],
+                prompt_stdin: false,
+                cwd: None,
+            },
+        );
+        agents.insert(
             "ollama".to_owned(),
             AgentConfig {
                 command: vec!["ollama".to_owned(), "run".to_owned(), "llama3".to_owned()],
@@ -121,20 +147,25 @@ pub fn load() -> Result<LoadedConfig> {
 }
 
 pub fn load_from_dir(current_dir: &Path) -> Result<LoadedConfig> {
-    let project_config = current_dir.join(PROJECT_CONFIG_FILE);
-    if project_config.exists() {
-        return load_path(&project_config);
-    }
-
-    let home_config = home_config_path()?;
-    if home_config.exists() {
-        return load_path(&home_config);
+    let home = platform::home_dir()?;
+    let selected_path = preferred_config_path(current_dir, &home);
+    if selected_path.exists() {
+        return load_path(&selected_path);
     }
 
     Ok(LoadedConfig {
-        path: home_config,
+        path: selected_path,
         config: Config::default(),
     })
+}
+
+pub fn preferred_config_path(current_dir: &Path, home: &Path) -> PathBuf {
+    let project_config = current_dir.join(PROJECT_CONFIG_FILE);
+    if project_config.exists() {
+        return project_config;
+    }
+
+    home.join(CONFIG_DIR).join(CONFIG_FILE)
 }
 
 pub fn generate() -> Result<PathBuf> {
@@ -198,8 +229,7 @@ pub fn validate(config: &Config) -> Result<()> {
 }
 
 pub fn home_config_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(CONFIG_DIR).join(CONFIG_FILE))
+    Ok(platform::home_dir()?.join(CONFIG_DIR).join(CONFIG_FILE))
 }
 
 fn load_path(path: &Path) -> Result<LoadedConfig> {
