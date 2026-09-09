@@ -33,6 +33,8 @@ fn config_generate_and_check_round_trips_through_cli() {
     assert!(show_output.status.success());
     let show = String::from_utf8(show_output.stdout).expect("show utf8");
     assert!(show.contains("[summary]"));
+    assert!(show.contains("danger-full-access"));
+    assert!(!show.contains("workspace-write"));
     for profile in [
         "[agents.codex]",
         "[agents.claude-code]",

@@ -33,6 +33,9 @@ enum Command {
         prompt_file: Option<PathBuf>,
         #[arg(long)]
         detach: bool,
+        /// Restrict a Codex worker to workspace writes (Git metadata stays read-only).
+        #[arg(long)]
+        sandbox: bool,
         #[arg(long, default_value_t = 1)]
         iterations: u32,
         #[arg(long)]
@@ -127,6 +130,7 @@ fn main() -> Result<()> {
             prompt,
             prompt_file,
             detach,
+            sandbox,
             iterations,
             cwd,
             json,
@@ -140,7 +144,7 @@ fn main() -> Result<()> {
                 let loaded = agentctl::config::check().with_context(|| {
                     "Agentctl configuration is invalid; run `agentctl discover` for recovery options"
                 })?;
-                let resolved =
+                let mut resolved =
                     agentctl::discovery::resolve_agent(&loaded, agent.as_deref(), !no_fallback)?;
                 if resolved.name.starts_with("ldgr-loop") || resolved.name == "ldgr-summary" {
                     agentctl::compatibility::negotiate(Path::new(".")).map_err(|error| {
@@ -148,6 +152,9 @@ fn main() -> Result<()> {
                             "LDGR launcher/Core compatibility negotiation failed before worker startup",
                         )
                     })?;
+                }
+                if sandbox {
+                    restrict_codex_worker(&mut resolved.agent.command)?;
                 }
                 let prompt = read_prompt(prompt.as_deref(), prompt_file.as_deref())?;
                 let cwd = resolve_cwd(resolved.agent.cwd.as_deref(), cwd.as_deref())?;
@@ -273,6 +280,51 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn restrict_codex_worker(command: &mut Vec<String>) -> Result<()> {
+    let executable = command
+        .first()
+        .and_then(|value| Path::new(value).file_stem())
+        .and_then(|name| name.to_str());
+    if !executable.is_some_and(|name| name.eq_ignore_ascii_case("codex"))
+        || command.get(1).map(String::as_str) != Some("exec")
+    {
+        bail!("--sandbox requires a profile whose command starts with `codex exec`");
+    }
+
+    let mut restricted = command[..2].to_vec();
+    let mut args = command[2..].iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--" => {
+                restricted.extend(["--sandbox".to_owned(), "workspace-write".to_owned()]);
+                restricted.push(arg.clone());
+                restricted.extend(args.cloned());
+                *command = restricted;
+                return Ok(());
+            }
+            "--sandbox" | "-s" => {
+                args.next()
+                    .context("configured sandbox flag is missing its value")?;
+            }
+            "--dangerously-bypass-approvals-and-sandbox" | "--yolo" | "--full-auto" => {}
+            value if value.starts_with("--sandbox=") || value.starts_with("-s=") => {}
+            // Preserve values verbatim: they may happen to look like flags.
+            "--config" | "-c" | "--model" | "-m" | "--profile" | "-p" => {
+                restricted.push(arg.clone());
+                restricted.push(
+                    args.next()
+                        .context("configured flag is missing its value")?
+                        .clone(),
+                );
+            }
+            _ => restricted.push(arg.clone()),
+        }
+    }
+    restricted.extend(["--sandbox".to_owned(), "workspace-write".to_owned()]);
+    *command = restricted;
+    Ok(())
+}
+
 fn read_prompt(prompt: Option<&str>, prompt_file: Option<&Path>) -> Result<String> {
     match (prompt, prompt_file) {
         (Some(_), Some(_)) => bail!("use either --prompt or --prompt-file, not both"),
@@ -359,5 +411,53 @@ fn print_job_status(status: &agentctl::jobs::JobStatus) {
         for line in &status.tail_lines {
             println!("{line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_replaces_full_access_and_preserves_worker_options() {
+        for flags in [
+            vec!["--sandbox", "danger-full-access"],
+            vec!["-s", "danger-full-access"],
+            vec!["--sandbox=danger-full-access"],
+            vec!["--dangerously-bypass-approvals-and-sandbox"],
+            vec!["--yolo"],
+            vec!["--full-auto"],
+        ] {
+            let mut command: Vec<String> = [
+                vec!["codex", "exec", "--model", "test-model"],
+                flags,
+                vec!["--", "-"],
+            ]
+            .concat()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            restrict_codex_worker(&mut command).unwrap();
+            assert_eq!(
+                command,
+                [
+                    "codex",
+                    "exec",
+                    "--model",
+                    "test-model",
+                    "--sandbox",
+                    "workspace-write",
+                    "--",
+                    "-"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_rejects_unsupported_runtimes() {
+        let mut command = vec!["claude".to_owned(), "-p".to_owned()];
+        assert!(restrict_codex_worker(&mut command).is_err());
+        assert_eq!(command, ["claude", "-p"]);
     }
 }

@@ -110,7 +110,7 @@ tail_bytes = 4096
 max_preview_lines = 12
 
 [agents.codex]
-command = ["codex", "exec", "--sandbox", "workspace-write"]
+command = ["codex", "exec", "--sandbox", "danger-full-access"]
 prompt_stdin = true
 
 [agents.pi]
@@ -163,7 +163,19 @@ agentctl run codex \
 printf 'Run cargo test and summarize the result.' | agentctl run --json
 ```
 
-That returns a job record:
+Codex profiles now default to `--sandbox danger-full-access`, allowing Git staging,
+commits, and branch creation. To opt into the restricted workspace sandbox, use
+`agentctl run codex --sandbox --prompt "Inspect the project"`. This also works with
+`--detach` and `--iterations`; `.git` remains read-only in that mode. The flag
+requires a profile whose command starts with `codex exec` (including an absolute
+path to Codex). Other runtimes retain their own permission settings.
+
+Existing config files retain their explicit commands. To migrate an older Codex
+profile, change its `workspace-write` argument to `danger-full-access` in
+`agentctl.toml` or `~/.agentctl/config.toml`. Workers still inherit any restrictions
+imposed by the process that launches agentctl.
+
+The detached command returns a job record:
 
 ```json
 {
@@ -174,7 +186,7 @@ That returns a job record:
   "started_at": 1780000000,
   "finished_at": null,
   "exit_code": null,
-  "command": "codex exec --sandbox workspace-write",
+  "command": "codex exec --sandbox danger-full-access",
   "cwd": "/path/to/project",
   "iterations": 1,
   "log_path": "~/.agentctl/jobs/1780000000-1234-codex/output.log"
@@ -234,7 +246,7 @@ Detached `run --json` and `list --json` use job records:
   "started_at": 1780000000,
   "finished_at": null,
   "exit_code": null,
-  "command": "codex exec --sandbox workspace-write",
+  "command": "codex exec --sandbox danger-full-access",
   "cwd": "/path/to/project",
   "iterations": 1,
   "log_path": "/path/to/output.log"

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3 - 2026-09-08
+
+- Allow Codex workers to write Git metadata by default using full access.
+- Add `agentctl run codex --sandbox` to opt into the restricted workspace sandbox for foreground and detached workers.
+
 ## 0.1.2 - 2026-07-30
 
 - Persist supervisor-owned execution intents and first-class recovery envelopes before worker startup.

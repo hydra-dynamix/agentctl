@@ -60,7 +60,7 @@ impl Default for Config {
                     "codex".to_owned(),
                     "exec".to_owned(),
                     "--sandbox".to_owned(),
-                    "workspace-write".to_owned(),
+                    "danger-full-access".to_owned(),
                 ],
                 prompt_stdin: true,
                 cwd: None,

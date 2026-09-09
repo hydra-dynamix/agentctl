@@ -43,9 +43,11 @@ agentctl exec [--json] [--raw] [--label <name>] -- <command...>
     Raw capture stored under the job directory either way.
 
 agentctl run <agent> [--prompt <text> | --prompt-file <path>]
-            [--detach] [--iterations <n>] [--cwd <dir>] [--json]
+            [--detach] [--sandbox] [--iterations <n>] [--cwd <dir>] [--json]
     Launch a configured agent. Foreground: summarized report per iteration.
     --detach: returns a job id immediately.
+    --sandbox: opt into workspace-write for a codex exec profile; Git metadata
+    remains read-only. Codex defaults to danger-full-access without this flag.
 
 agentctl status <job-id> [--tail <n>] [--json]
 agentctl list [--json]
@@ -82,7 +84,7 @@ max_preview_lines = 12       # notable-line preview length
 # summarizer_command = ["claude", "-p", "Summarize this build output"]
 
 [agents.codex]
-command = ["codex", "exec", "--sandbox", "workspace-write"]
+command = ["codex", "exec", "--sandbox", "danger-full-access"]
 prompt_stdin = true
 # cwd = "/path/to/project"
 
