@@ -36,8 +36,8 @@ fn clamp_start_to_char_boundary(value: &str, mut index: usize) -> usize {
 pub fn combine_output(stdout: &str, stderr: &str) -> String {
     match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
         (true, true) => String::new(),
-        (false, true) => format!("stdout:\n{}", stdout),
-        (true, false) => format!("stderr:\n{}", stderr),
+        (false, true) => format!("stdout:\n{stdout}"),
+        (true, false) => format!("stderr:\n{stderr}"),
         (false, false) => format!("stdout:\n{}\nstderr:\n{}", stdout.trim_end(), stderr),
     }
 }

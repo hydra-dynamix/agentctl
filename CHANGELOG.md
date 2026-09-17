@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 - 2026-09-17
+
+- Reap successfully exited adopted descendants throughout active Linux agent runs instead of retaining them as zombies until the direct agent exits.
+- Preserve direct-child exit status ownership while processing `SIGCHLD`, with a regression test for long-running agents that launch detached helpers.
+
 ## 0.1.3 - 2026-09-08
 
 - Allow Codex workers to write Git metadata by default using full access.

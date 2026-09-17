@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 #[cfg(unix)]
-use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+use signal_hook::consts::signal::{SIGCHLD, SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::Signals;
 #[cfg(unix)]
@@ -65,7 +65,16 @@ impl ManagedChild {
         enable_subreaper()?;
         configure_process_group(command);
         install_signal_forwarder()?;
-        let child = command.spawn()?;
+        #[cfg(unix)]
+        ACTIVE_PROCESS_GROUP.store(-1, Ordering::SeqCst);
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                #[cfg(unix)]
+                ACTIVE_PROCESS_GROUP.store(0, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
 
         #[cfg(unix)]
         {
@@ -220,11 +229,17 @@ fn install_signal_forwarder() -> io::Result<()> {
         return Ok(());
     }
 
-    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT])?;
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGCHLD])?;
     SIGNAL_FORWARDER.get_or_init(|| {
         std::thread::spawn(move || {
             for signal in signals.forever() {
                 let process_group = ACTIVE_PROCESS_GROUP.load(Ordering::SeqCst);
+                if signal == SIGCHLD {
+                    if process_group > 0 {
+                        reap_adopted_children_except(process_group);
+                    }
+                    continue;
+                }
                 if process_group > 0 {
                     // Negative PIDs address the complete process group.
                     unsafe {
@@ -322,8 +337,24 @@ fn reap_adopted_children() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn reap_adopted_children_except(excluded_pid: i32) {
+    for pid in linux_child_pids(std::process::id() as i32) {
+        if pid == excluded_pid {
+            continue;
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, libc::WNOHANG);
+        }
+    }
+}
+
 #[cfg(all(unix, not(target_os = "linux")))]
 fn reap_adopted_children() {}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn reap_adopted_children_except(_excluded_pid: i32) {}
 
 #[cfg(target_os = "linux")]
 fn adopted_children_exist() -> bool {
@@ -363,10 +394,14 @@ fn linux_child_pids(pid: i32) -> Vec<i32> {
 mod tests {
     use super::*;
     use std::process::Stdio;
+    use std::sync::Mutex;
+
+    static PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     #[cfg(unix)]
     fn wait_terminates_descendants_left_by_the_direct_child() {
+        let _test_guard = PROCESS_TEST_LOCK.lock().expect("process test lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let pid_path = temp.path().join("descendant.pid");
         let script = format!(
@@ -389,6 +424,70 @@ mod tests {
             .expect("numeric pid");
         let running = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!running, "descendant {pid} survived its agent command");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reaps_adopted_descendant_while_direct_child_is_running() {
+        let _test_guard = PROCESS_TEST_LOCK.lock().expect("process test lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let orphan_pid_path = temp.path().join("orphan.pid");
+        let release_path = temp.path().join("release");
+        let script = r#"
+            sh -c 'sleep 0.05 & printf "%s" "$!" > "$1"' agentctl-inner "$1"
+            while [ ! -e "$2" ]; do sleep 0.02; done
+        "#;
+        let mut command = Command::new("bash");
+        command
+            .args([
+                "-c",
+                script,
+                "agentctl-test",
+                orphan_pid_path.to_str().expect("UTF-8 orphan pid path"),
+                release_path.to_str().expect("UTF-8 release path"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = ManagedChild::spawn(&mut command).expect("spawn managed child");
+        let direct_pid = child.child.id() as i32;
+        let waiter = std::thread::spawn(move || child.wait());
+
+        let pid_deadline = Instant::now() + Duration::from_secs(2);
+        while !orphan_pid_path.is_file() && Instant::now() < pid_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let orphan_pid = std::fs::read_to_string(&orphan_pid_path)
+            .expect("orphan pid file")
+            .parse::<i32>()
+            .expect("numeric orphan pid");
+
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        let mut orphan_reaped = false;
+        while Instant::now() < reap_deadline {
+            if unsafe { libc::kill(orphan_pid, 0) } != 0 {
+                orphan_reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let direct_child_was_running = unsafe { libc::kill(direct_pid, 0) } == 0;
+
+        std::fs::write(&release_path, b"release").expect("release direct child");
+        let status = waiter
+            .join()
+            .expect("waiter thread")
+            .expect("wait managed child");
+
+        assert!(status.success());
+        assert!(
+            direct_child_was_running,
+            "direct child exited before the adopted descendant was checked"
+        );
+        assert!(
+            orphan_reaped,
+            "adopted descendant {orphan_pid} remained a zombie while the direct child was running"
+        );
     }
 }
 

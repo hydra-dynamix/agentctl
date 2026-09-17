@@ -571,7 +571,7 @@ fn deterministic_occurrence_id(attempt_id: &str, code: &str) -> String {
         .filter(|character| *character != '-')
         .take(12)
         .collect::<String>();
-    let random = format!("{:x}", digest);
+    let random = format!("{digest:x}");
     let variant = match &random[3..4] {
         "0" | "1" | "2" | "3" => "8",
         "4" | "5" | "6" | "7" => "9",

@@ -34,7 +34,7 @@ agentctl discover --json
 
 For an `ldgr-loop` or `ldgr-summary` profile, agentctl negotiates
 `ldgr.launcher-compatibility.v1` before reading worker output or starting the
-agent. Agentctl 0.1.2 requires LDGR Core `>=0.1.13, <0.2.0`. An older or mixed
+agent. Agentctl 0.1.x requires LDGR Core `>=0.1.13, <0.2.0`. An older or mixed
 Core is rejected with a durable `agentctl.compatibility/core-incompatible`
 recovery record and exact upgrade/rollback commands. Install both executables
 from the same LDGR Core release bundle.
@@ -93,8 +93,9 @@ Output is streamed to the raw log while only the configured head/tail window is
 retained in memory. Agent commands run in an isolated process group. Interrupting
 agentctl forwards the signal to the complete command tree, waits for it, and
 terminates descendants left behind by a command that exits early. On Linux,
-agentctl also adopts and reaps orphaned descendants so repeated tool loops do not
-accumulate zombie or live background agent processes. Native Windows commands
+agentctl also adopts and promptly reaps orphaned descendants while the direct agent
+is still running, so repeated tool loops do not accumulate zombie or live background
+agent processes. Native Windows commands
 are assigned to kill-on-close Job Objects, detached supervisors use a detached
 process group, and job status uses native process handles rather than Unix
 utilities.

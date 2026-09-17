@@ -242,7 +242,7 @@ pub fn format_command(argv: &[String]) -> String {
         .map(|arg| {
             if arg.chars().any(|character| character.is_whitespace()) {
                 let escaped = arg.replace('"', "\\\"");
-                format!("\"{}\"", escaped)
+                format!("\"{escaped}\"")
             } else {
                 arg.clone()
             }
