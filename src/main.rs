@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "agentctl")]
 #[command(about = "Compact, bounded command and agent reports for LLM tool loops")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -25,8 +26,7 @@ enum Command {
         argv: Vec<String>,
     },
     Run {
-        #[arg(default_value = "codex")]
-        agent: String,
+        agent: Option<String>,
         #[arg(long, conflicts_with = "prompt_file")]
         prompt: Option<String>,
         #[arg(long)]
@@ -42,6 +42,9 @@ enum Command {
         cwd: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// Do not use another LDGR-selected harness when the primary is unavailable.
+        #[arg(long)]
+        no_fallback: bool,
     },
     Status {
         job_id: String,
@@ -77,6 +80,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Detect the host platform, LDGR selection, and runnable harnesses.
+    Discover {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -87,6 +95,7 @@ enum ConfigCommand {
 }
 
 fn main() -> Result<()> {
+    agentctl::platform::repair_process_home()?;
     let cli = Cli::parse();
 
     match cli.command {
@@ -137,24 +146,68 @@ fn main() -> Result<()> {
             iterations,
             cwd,
             json,
+            no_fallback,
         } => {
-            let loaded = agentctl::config::check()?;
-            let agent_config =
-                loaded.config.agents.get(&agent).cloned().with_context(|| {
-                    format!("unknown agent `{agent}` in {}", loaded.path.display())
+            let attempt = agentctl::capture::ExecutionAttempt::begin(
+                Path::new("."),
+                agent.as_deref().unwrap_or("auto"),
+            )?;
+            let initialized = (|| -> Result<_> {
+                let loaded = agentctl::config::check().with_context(|| {
+                    "Agentctl configuration is invalid; run `agentctl discover` for recovery options"
                 })?;
-            let mut agent_config = materialize_provider_agent(agent_config, &loaded.path)?;
-            if sandbox {
-                restrict_codex_worker(&mut agent_config.command)?;
+                let mut resolved =
+                    agentctl::discovery::resolve_agent(&loaded, agent.as_deref(), !no_fallback)?;
+                if resolved.name.starts_with("ldgr-loop") || resolved.name == "ldgr-summary" {
+                    agentctl::compatibility::negotiate(Path::new(".")).map_err(|error| {
+                        anyhow::Error::new(error).context(
+                            "LDGR launcher/Core compatibility negotiation failed before worker startup",
+                        )
+                    })?;
+                }
+                resolved.agent = materialize_provider_agent(resolved.agent, &loaded.path)?;
+                if sandbox {
+                    restrict_codex_worker(&mut resolved.agent.command)?;
+                }
+                let prompt = read_prompt(prompt.as_deref(), prompt_file.as_deref())?;
+                let cwd = resolve_cwd(resolved.agent.cwd.as_deref(), cwd.as_deref())?;
+                Ok((loaded, resolved, prompt, cwd))
+            })();
+            let (loaded, resolved, prompt, cwd) = match initialized {
+                Ok(initialized) => initialized,
+                Err(error) => {
+                    let rendered = format!("{error:#}");
+                    let failure = if rendered.contains("compatibility negotiation")
+                        || rendered.contains("requires LDGR Core")
+                    {
+                        let detected_core_version =
+                            agentctl::compatibility::status(Path::new(".")).core_version;
+                        agentctl::capture::FailureKind::CoreIncompatible {
+                            detected_core_version,
+                        }
+                    } else if rendered.to_ascii_lowercase().contains("home")
+                        || format!("{error:#}").contains("current directory")
+                    {
+                        agentctl::capture::FailureKind::Environment
+                    } else {
+                        agentctl::capture::FailureKind::Configuration
+                    };
+                    attempt
+                        .record_error(failure)
+                        .context("persisting accepted agent bootstrap failure")?;
+                    return Err(error);
+                }
+            };
+            for warning in &resolved.warnings {
+                eprintln!("warning: {warning}");
             }
-            let prompt = read_prompt(prompt.as_deref(), prompt_file.as_deref())?;
-            let cwd = resolve_cwd(agent_config.cwd.as_deref(), cwd.as_deref())?;
             let options = agentctl::jobs::AgentRunOptions {
-                agent_name: agent,
-                agent: agent_config,
+                agent_name: resolved.name,
+                agent: resolved.agent,
                 prompt,
                 cwd,
                 iterations,
+                attempt,
             };
             if detach {
                 let record = agentctl::jobs::launch_detached(&options)?;
@@ -258,6 +311,14 @@ fn main() -> Result<()> {
                 print!("{}", agentctl::config::show()?);
             }
         },
+        Command::Discover { json } => {
+            let report = agentctl::discovery::diagnose()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                agentctl::discovery::print_human(&report);
+            }
+        }
     }
 
     Ok(())

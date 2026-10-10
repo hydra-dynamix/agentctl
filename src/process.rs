@@ -346,3 +346,156 @@ mod tests {
         assert!(!running, "descendant {pid} survived its agent command");
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod upstream_tests {
+    use super::*;
+    use std::process::Stdio;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    #[cfg(unix)]
+    fn wait_terminates_descendants_left_by_the_direct_child() {
+        let _test_guard = PROCESS_TEST_LOCK.lock().expect("process test lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("descendant.pid");
+        let script = format!(
+            "setsid sleep 30 & printf '%s' $! > '{}'; exit 0",
+            pid_path.display()
+        );
+        let mut command = Command::new("bash");
+        command
+            .args(["-c", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = ManagedChild::spawn(&mut command).expect("spawn managed child");
+        let status = child.wait().expect("wait managed child");
+        assert!(status.success());
+
+        let pid = std::fs::read_to_string(pid_path)
+            .expect("descendant pid")
+            .parse::<i32>()
+            .expect("numeric pid");
+        let running = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!running, "descendant {pid} survived its agent command");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn reaps_adopted_descendant_while_direct_child_is_running() {
+        let _test_guard = PROCESS_TEST_LOCK.lock().expect("process test lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let orphan_pid_path = temp.path().join("orphan.pid");
+        let release_path = temp.path().join("release");
+        let script = r#"
+            sh -c 'sleep 0.05 & printf "%s" "$!" > "$1"' agentctl-inner "$1"
+            while [ ! -e "$2" ]; do sleep 0.02; done
+        "#;
+        let mut command = Command::new("bash");
+        command
+            .args([
+                "-c",
+                script,
+                "agentctl-test",
+                orphan_pid_path.to_str().expect("UTF-8 orphan pid path"),
+                release_path.to_str().expect("UTF-8 release path"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = ManagedChild::spawn(&mut command).expect("spawn managed child");
+        let direct_pid = child.child.id() as i32;
+        let waiter = std::thread::spawn(move || child.wait());
+
+        let pid_deadline = Instant::now() + Duration::from_secs(2);
+        while !orphan_pid_path.is_file() && Instant::now() < pid_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let orphan_pid = std::fs::read_to_string(&orphan_pid_path)
+            .expect("orphan pid file")
+            .parse::<i32>()
+            .expect("numeric orphan pid");
+
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        let mut orphan_reaped = false;
+        while Instant::now() < reap_deadline {
+            if unsafe { libc::kill(orphan_pid, 0) } != 0 {
+                orphan_reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let direct_child_was_running = unsafe { libc::kill(direct_pid, 0) } == 0;
+
+        std::fs::write(&release_path, b"release").expect("release direct child");
+        let status = waiter
+            .join()
+            .expect("waiter thread")
+            .expect("wait managed child");
+
+        assert!(status.success());
+        assert!(
+            direct_child_was_running,
+            "direct child exited before the adopted descendant was checked"
+        );
+        assert!(
+            orphan_reaped,
+            "adopted descendant {orphan_pid} remained a zombie while the direct child was running"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::process::Stdio;
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    #[test]
+    fn wait_terminates_descendants_in_the_windows_job_object() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_path = temp.path().join("descendant.pid");
+        let escaped_path = pid_path.display().to_string().replace('\'', "''");
+        let script = format!(
+            "$child = Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep 30' -PassThru; Set-Content -NoNewline -LiteralPath '{escaped_path}' -Value $child.Id"
+        );
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-Command", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut child = ManagedChild::spawn(&mut command).expect("spawn managed child");
+        let status = child.wait().expect("wait managed child");
+        assert!(status.success());
+
+        let pid = std::fs::read_to_string(pid_path)
+            .expect("descendant pid")
+            .parse::<u32>()
+            .expect("numeric pid");
+        assert!(
+            !process_is_running(pid),
+            "descendant {pid} survived its Windows job object"
+        );
+    }
+
+    fn process_is_running(pid: u32) -> bool {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0;
+        let success = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+        unsafe {
+            CloseHandle(handle);
+        }
+        success && exit_code == STILL_ACTIVE as u32
+    }
+}

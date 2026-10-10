@@ -52,27 +52,22 @@ fn exec_passthrough_failing_exit_code_and_summary() {
     let project_dir = tempfile::tempdir().expect("project tempdir");
     generate_config(&home_dir, &project_dir);
 
-    let output = Command::cargo_bin("agentctl")
-        .expect("agentctl binary")
+    let mut command = Command::cargo_bin("agentctl").expect("agentctl binary");
+    command
         .current_dir(project_dir.path())
         .env("HOME", home_dir.path())
-        .args([
-            "exec",
-            "--json",
-            "--",
-            "python",
-            "-c",
-            "import sys; print('warning: careful', file=sys.stderr); sys.exit(7)",
-        ])
-        .output()
-        .expect("run failing agentctl exec");
+        .args(["exec", "--json", "--"])
+        .args(failing_command());
+    let output = command.output().expect("run failing agentctl exec");
 
     assert_eq!(output.status.code(), Some(7));
     let json: Value = serde_json::from_slice(&output.stdout).expect("json summary");
     assert_summary_schema(&json);
     assert_eq!(json.get("exit_code").and_then(Value::as_i64), Some(7));
     assert_eq!(
-        json.pointer("/preview_lines/0").and_then(Value::as_str),
+        json.pointer("/preview_lines/0")
+            .and_then(Value::as_str)
+            .map(str::trim),
         Some("warning: careful")
     );
 }
@@ -83,25 +78,47 @@ fn exec_raw_streams_child_output_without_summary_json() {
     let project_dir = tempfile::tempdir().expect("project tempdir");
     generate_config(&home_dir, &project_dir);
 
-    let output = Command::cargo_bin("agentctl")
-        .expect("agentctl binary")
+    let mut command = Command::cargo_bin("agentctl").expect("agentctl binary");
+    command
         .current_dir(project_dir.path())
         .env("HOME", home_dir.path())
-        .args([
-            "exec",
-            "--raw",
-            "--json",
-            "--",
-            "python",
-            "-c",
-            "import sys; sys.stdout.write('raw-out'); sys.stderr.write('raw-err')",
-        ])
-        .output()
-        .expect("run raw agentctl exec");
+        .args(["exec", "--raw", "--json", "--"])
+        .args(raw_command());
+    let output = command.output().expect("run raw agentctl exec");
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "raw-out");
     assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "raw-err");
+}
+
+#[cfg(unix)]
+fn failing_command() -> Vec<&'static str> {
+    vec!["sh", "-c", "echo warning: careful >&2; exit 7"]
+}
+
+#[cfg(windows)]
+fn failing_command() -> Vec<&'static str> {
+    vec![
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        "[Console]::Error.WriteLine('warning: careful'); exit 7",
+    ]
+}
+
+#[cfg(unix)]
+fn raw_command() -> Vec<&'static str> {
+    vec!["sh", "-c", "printf raw-out; printf raw-err >&2"]
+}
+
+#[cfg(windows)]
+fn raw_command() -> Vec<&'static str> {
+    vec![
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        "[Console]::Out.Write('raw-out'); [Console]::Error.Write('raw-err')",
+    ]
 }
 
 fn assert_summary_schema(json: &Value) {

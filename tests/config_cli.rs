@@ -82,9 +82,24 @@ fn top_level_help_lists_public_cli_surface() {
 
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).expect("help utf8");
-    for command in ["exec", "run", "status", "list", "logs", "config"] {
+    for command in [
+        "exec", "run", "status", "list", "logs", "config", "discover",
+    ] {
         assert!(help.contains(command), "help should list {command}");
     }
+}
+
+#[test]
+fn version_is_available_for_compatibility_checks() {
+    let output = Command::cargo_bin("agentctl")
+        .expect("agentctl binary")
+        .arg("--version")
+        .output()
+        .expect("version output");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("version utf8");
+    assert!(stdout.starts_with("agentctl "));
 }
 
 #[test]

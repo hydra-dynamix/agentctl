@@ -25,6 +25,43 @@ agentctl config check
 `~/.agentctl/jobs/`.
 On Windows, `USERPROFILE` is used when `HOME` is unset.
 
+Inspect the current platform, home-directory resolution, LDGR harness
+selection, configured agents, and commands actually available on `PATH`:
+
+```sh
+agentctl discover
+agentctl discover --json
+```
+
+For an `ldgr-loop` or `ldgr-summary` profile, agentctl negotiates
+`ldgr.launcher-compatibility.v1` before reading worker output or starting the
+agent. Agentctl 0.1.x requires LDGR Core `>=0.1.13, <0.2.0`. An older or mixed
+Core is rejected with a durable `agentctl.compatibility/core-incompatible`
+recovery record and exact upgrade/rollback commands. Install both executables
+from the same LDGR Core release bundle.
+
+Agentctl works with `HOME` on Unix, macOS, WSL, and Windows environments that
+provide it. Native Windows also falls back to `USERPROFILE`, then
+`HOMEDRIVE` + `HOMEPATH`; `AGENTCTL_HOME` is an explicit final configuration
+override for unusual service or test environments. A synthesized home is
+passed to child harnesses as `HOME`.
+
+`ldgr install` records its ordered harness selection in
+`~/.ldgr/config.toml`. Agentctl also reads the older
+`~/.ldgr/config.json` during migration. Resolution order is:
+
+1. an explicit `agentctl run <agent>` profile;
+2. a runnable generic `ldgr-loop` profile;
+3. the first runnable profile among LDGR's default and selected harnesses;
+4. for an agent omitted on the command line, another runnable configured
+   profile.
+
+An unavailable explicit non-LDGR profile never silently changes providers.
+When the generic LDGR profile is stale, Agentctl can use the next selected
+harness and prints the decision to stderr. Pass `--no-fallback` to disable that
+behavior. Failures list the detected platform, config source, selected
+harnesses, runnable alternatives, and repair commands.
+
 ## Wrap a noisy command
 
 Use `exec` when an agent wants to run a command but should receive only the
@@ -82,6 +119,10 @@ max_preview_lines = 12
 command = ["codex", "exec", "--sandbox", "danger-full-access"]
 prompt_stdin = true
 
+[agents.pi]
+command = ["pi", "-p"]
+prompt_stdin = false
+
 [agents.claude-code]
 command = ["claude", "-p"]
 prompt_stdin = false
@@ -122,6 +163,14 @@ prompt_stdin = true
 [agents.openrouter]
 command = ["pi", "--provider", "openrouter", "--model", "openrouter/auto", "--print", "--no-session"]
 prompt_stdin = false
+
+[agents.openclaw]
+command = ["openclaw", "run"]
+prompt_stdin = false
+
+[agents.opencode]
+command = ["opencode", "run"]
+prompt_stdin = false
 ```
 
 Use either OpenRouter profile:
@@ -143,13 +192,14 @@ agentctl run codex \
   --detach \
   --json
 
-# codex is the default agent, and stdin is accepted as the prompt:
+# With no explicit profile, Agentctl uses the valid LDGR selection when
+# available and otherwise prefers codex. Stdin is accepted as the prompt:
 printf 'Run cargo test and summarize the result.' | agentctl run --json
 ```
 
 Codex profiles now default to `--sandbox danger-full-access`, allowing Git staging,
 commits, and branch creation. To opt into the restricted workspace sandbox, use
-`agentctl run --sandbox --prompt "Inspect the project"`. This also works with
+`agentctl run codex --sandbox --prompt "Inspect the project"`. This also works with
 `--detach` and `--iterations`; `.git` remains read-only in that mode. The flag
 requires a profile whose command starts with `codex exec` (including an absolute
 path to Codex). Other runtimes retain their own permission settings.

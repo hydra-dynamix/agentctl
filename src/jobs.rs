@@ -10,8 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::capture::{ExecutionAttempt, FailureKind};
 use crate::config::{AgentConfig, CONFIG_DIR, SummaryConfig};
 use crate::exec::{CaptureOptions, CapturedRun, ProcessOptions, format_command, run_captured_with};
+use crate::platform;
 #[cfg(not(windows))]
 use crate::process::spawn_detached;
 use crate::summary::{Summary, summarize, summarize_with_command};
@@ -23,6 +25,7 @@ pub struct AgentRunOptions {
     pub prompt: String,
     pub cwd: PathBuf,
     pub iterations: u32,
+    pub attempt: ExecutionAttempt,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +76,8 @@ struct StoredJobRecord {
     iterations: u32,
     log_path: PathBuf,
     exit_code_path: PathBuf,
+    #[serde(default)]
+    attempt: Option<ExecutionAttempt>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -84,6 +89,7 @@ struct SupervisorSpec {
     iterations: u32,
     exit_code_path: PathBuf,
     label: String,
+    attempt: ExecutionAttempt,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,7 +105,13 @@ pub fn run_foreground(
     validate_options(options)?;
     let mut reports = Vec::new();
     for iteration in 1..=options.iterations {
-        let run = run_agent_once(options, summary_config, iteration)?;
+        let run = match run_agent_once(options, summary_config, iteration) {
+            Ok(run) => run,
+            Err(error) => {
+                options.attempt.record_error(FailureKind::Spawn)?;
+                return Err(error);
+            }
+        };
         let summary = match &summary_config.summarizer_command {
             Some(command) => summarize_with_command(&run, summary_config, command)
                 .unwrap_or_else(|_| summarize(&run, summary_config)),
@@ -112,9 +124,13 @@ pub fn run_foreground(
             summary,
         });
         if exit_code != 0 {
+            options
+                .attempt
+                .record_error(failure_from_status(run.exit_status))?;
             break;
         }
     }
+    options.attempt.complete();
     Ok(reports)
 }
 
@@ -154,6 +170,7 @@ pub fn launch_detached_with_executable(
         iterations: options.iterations,
         exit_code_path: exit_code_path.clone(),
         label: options.agent_name.clone(),
+        attempt: options.attempt.clone(),
     };
     fs::write(&supervisor_path, toml::to_string_pretty(&supervisor)?)
         .with_context(|| format!("writing {}", supervisor_path.display()))?;
@@ -161,12 +178,18 @@ pub fn launch_detached_with_executable(
     #[cfg(windows)]
     let pid = {
         drop(stdout);
-        crate::windows_process::spawn_supervisor(
+        match crate::windows_process::spawn_supervisor(
             executable,
             &supervisor_path,
             &options.cwd,
             &log_path,
-        )?
+        ) {
+            Ok(pid) => pid,
+            Err(error) => {
+                options.attempt.record_error(FailureKind::Spawn)?;
+                return Err(error).context("launching detached supervisor");
+            }
+        }
     };
     #[cfg(not(windows))]
     let pid = {
@@ -176,9 +199,17 @@ pub fn launch_detached_with_executable(
         command.stdin(Stdio::null());
         command.stdout(Stdio::from(stdout));
         command.stderr(Stdio::from(stderr));
+        platform::configure_child_home(&mut command)?;
 
-        let child = spawn_detached(&mut command)
-            .with_context(|| format!("launching detached agent `{}`", format_command(&argv)))?;
+        let child = match spawn_detached(&mut command) {
+            Ok(child) => child,
+            Err(error) => {
+                options.attempt.record_error(FailureKind::Spawn)?;
+                return Err(error).with_context(|| {
+                    format!("launching detached agent `{}`", format_command(&argv))
+                });
+            }
+        };
         let pid = child.id();
         // Reap the supervisor when a long-lived library caller outlives it.
         thread::spawn(move || {
@@ -198,6 +229,7 @@ pub fn launch_detached_with_executable(
         iterations: options.iterations,
         log_path,
         exit_code_path,
+        attempt: Some(options.attempt.clone()),
     };
     fs::write(&job_path, toml::to_string_pretty(&stored)?)
         .with_context(|| format!("writing {}", job_path.display()))?;
@@ -238,17 +270,23 @@ pub fn supervise(path: &Path) -> Result<i32> {
             Ok(run) => {
                 exit_code = exit_status_code(run.exit_status);
                 if exit_code != 0 {
+                    spec.attempt
+                        .record_error(failure_from_status(run.exit_status))?;
                     break;
                 }
             }
             Err(error) => {
                 eprintln!("agent supervisor failed: {error:#}");
+                spec.attempt.record_error(FailureKind::Spawn)?;
                 exit_code = 1;
                 break;
             }
         }
     }
     write_exit_record(&spec.exit_code_path, exit_code)?;
+    if exit_code == 0 {
+        spec.attempt.complete();
+    }
     Ok(exit_code)
 }
 
@@ -383,6 +421,11 @@ fn record_from_stored(stored: StoredJobRecord) -> Result<JobRecord> {
             None => JobState::Stale,
         }
     };
+    if state == JobState::Stale
+        && let Some(attempt) = &stored.attempt
+    {
+        attempt.record_error(FailureKind::UnexpectedDisappearance)?;
+    }
     Ok(JobRecord {
         id: stored.id,
         agent: stored.agent,
@@ -419,8 +462,16 @@ fn read_exit_record(path: &Path) -> Result<ExitRecord> {
 
 fn write_exit_record(path: &Path, exit_code: i32) -> Result<()> {
     let finished_at = unix_timestamp()?;
-    fs::write(path, format!("{exit_code}\nfinished_at={finished_at}\n"))
-        .with_context(|| format!("writing {}", path.display()))
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut file = fs::File::create(&temporary)
+        .with_context(|| format!("creating {}", temporary.display()))?;
+    file.write_all(format!("{exit_code}\nfinished_at={finished_at}\n").as_bytes())
+        .with_context(|| format!("writing {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", temporary.display()))?;
+    drop(file);
+    fs::rename(&temporary, path)
+        .with_context(|| format!("atomically publishing terminal record {}", path.display()))
 }
 
 fn exit_status_code(status: ExitStatus) -> i32 {
@@ -438,6 +489,17 @@ fn exit_status_code(status: ExitStatus) -> i32 {
     {
         1
     }
+}
+
+fn failure_from_status(status: ExitStatus) -> FailureKind {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return FailureKind::Signal(signal);
+        }
+    }
+    FailureKind::ExitCode(status.code().unwrap_or(1))
 }
 
 fn read_job(job_id: &str) -> Result<StoredJobRecord> {
@@ -473,7 +535,7 @@ fn read_tail_lines(path: &Path, tail: usize) -> Result<Vec<String>> {
 }
 
 fn jobs_dir() -> Result<PathBuf> {
-    Ok(crate::config::home_dir()?.join(CONFIG_DIR).join("jobs"))
+    Ok(platform::home_dir()?.join(CONFIG_DIR).join("jobs"))
 }
 
 fn job_id(agent_name: &str) -> String {
@@ -578,10 +640,42 @@ mod tests {
             iterations: 1,
             log_path: temp_dir.path().join("output.log"),
             exit_code_path: temp_dir.path().join("exit-code"),
+            attempt: None,
         };
 
         let record = record_from_stored(stored).expect("record");
 
         assert_eq!(record.state, JobState::Stale);
+    }
+
+    #[test]
+    fn stale_supervisor_records_unexpected_disappearance() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let attempt =
+            ExecutionAttempt::begin(temp_dir.path(), "test-agent").expect("execution intent");
+        let stored = StoredJobRecord {
+            id: "job".to_owned(),
+            agent: "test".to_owned(),
+            pid: 0,
+            started_at: 1,
+            command: "redacted".to_owned(),
+            cwd: temp_dir.path().to_path_buf(),
+            iterations: 1,
+            log_path: temp_dir.path().join("output.log"),
+            exit_code_path: temp_dir.path().join("exit-code"),
+            attempt: Some(attempt),
+        };
+
+        let record = record_from_stored(stored).expect("record");
+
+        assert_eq!(record.state, JobState::Stale);
+        let inbox = temp_dir.path().join(".ldgr/recovery/inbox");
+        let recovery = fs::read_dir(inbox)
+            .expect("recovery inbox")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| fs::read_to_string(entry.path()).expect("recovery record"))
+            .find(|payload| payload.contains("unexpected-disappearance"))
+            .expect("unexpected disappearance record");
+        assert!(!recovery.contains("redacted"));
     }
 }

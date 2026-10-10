@@ -1,0 +1,151 @@
+name: Binary release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version to release. Must match Cargo.toml."
+        required: false
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as prerelease"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          requested_version="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
+          version="${requested_version:-$cargo_version}"
+          test "$version" = "$cargo_version"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            test "${GITHUB_REF_NAME}" = "v${version}"
+          fi
+          prerelease="true"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            prerelease="${{ inputs.prerelease }}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: metadata
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            binary_ext: ""
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            binary_ext: ""
+          - os: macos-15-intel
+            platform: macos-x86_64
+            binary_ext: ""
+          - os: macos-14
+            platform: macos-aarch64
+            binary_ext: ""
+          - os: windows-latest
+            platform: windows-x86_64
+            binary_ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and smoke
+        shell: bash
+        run: |
+          cargo build --locked --release
+          "target/release/agentctl${{ matrix.binary_ext }}" --version
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.metadata.outputs.version }}"
+          platform="${{ matrix.platform }}"
+          binary="agentctl${{ matrix.binary_ext }}"
+          root="dist/agentctl-${version}"
+          staging="${root}/${platform}"
+          archive="dist/agentctl-${version}-${platform}.tar.gz"
+          mkdir -p "$staging"
+          cp "target/release/${binary}" "$staging/${binary}"
+          chmod +x "$staging/${binary}" || true
+          cp README.md LICENSE "$root/"
+          cat > "$root/RELEASE-METADATA.json" <<JSON
+          {
+            "schema_version": 1,
+            "package": "agentctl",
+            "binary": "agentctl",
+            "version": "${version}",
+            "platform": "${platform}",
+            "commit": "${GITHUB_SHA}",
+            "ldgr_core_compatibility": ">=0.1.13, <0.2.0"
+          }
+          JSON
+          tar -C dist -czf "$archive" "agentctl-${version}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: |
+            dist/agentctl-${{ needs.metadata.outputs.version }}-${{ matrix.platform }}.tar.gz
+            dist/agentctl-${{ needs.metadata.outputs.version }}-${{ matrix.platform }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify and publish complete matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.metadata.outputs.version }}"
+          for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64 windows-x86_64; do
+            archive="dist/agentctl-${version}-${platform}.tar.gz"
+            test -s "$archive"
+            test -s "${archive}.sha256"
+            sha256sum -c "${archive}.sha256"
+          done
+          tag="v${version}"
+          prerelease_flag=""
+          if [[ "${{ needs.metadata.outputs.prerelease }}" == "true" ]]; then
+            prerelease_flag="--prerelease"
+          fi
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "agentctl v${version}" \
+              --notes "Paired launcher for LDGR Core 0.1.13 first-class error recovery." \
+              $prerelease_flag
+          fi
+          gh release upload "$tag" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
