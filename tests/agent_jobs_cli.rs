@@ -11,11 +11,11 @@ tail_bytes = 4096
 max_preview_lines = 12
 
 [agents.trivial]
-command = ["bash", "-c", "echo done"]
+command = ["python", "-c", "print('done')"]
 prompt_stdin = false
 
 [agents.stdin_loop]
-command = ["bash", "-c", "prompt=$(cat); echo prompt=$prompt; echo iteration=$AGENTCTL_AGENT_ITERATION"]
+command = ["python", "-c", "import os, sys; prompt=sys.stdin.read(); print('prompt='+prompt); print('iteration='+os.environ.get('AGENTCTL_AGENT_ITERATION',''))"]
 prompt_stdin = true
 "#,
     )
@@ -35,7 +35,7 @@ tail_bytes = 4096
 max_preview_lines = 12
 
 [agents.codex]
-command = ["bash", "-c", "prompt=$(cat); echo default-codex=$prompt"]
+command = ["python", "-c", "import sys; print('default-codex='+sys.stdin.read())"]
 prompt_stdin = true
 "#,
     )
@@ -102,6 +102,107 @@ fn foreground_agent_reports_each_iteration_as_summary_json() {
             .to_string()
             .contains("iteration=2")
     );
+}
+
+#[test]
+fn native_openrouter_provider_runs_through_agent_profile() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock OpenRouter");
+    let address = listener.local_addr().expect("mock address");
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept OpenRouter request");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = socket.read(&mut buffer).expect("read request");
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + content_length {
+                break;
+            }
+        }
+        let body = br#"{"choices":[{"message":{"content":"provider-profile-ok"}}]}"#;
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write response headers");
+        socket.write_all(body).expect("write response body");
+        String::from_utf8(request).expect("request UTF-8")
+    });
+
+    let home_dir = tempfile::tempdir().expect("home tempdir");
+    let project_dir = tempfile::tempdir().expect("project tempdir");
+    std::fs::write(
+        project_dir.path().join("agentctl.toml"),
+        format!(
+            r#"
+[summary]
+max_output_bytes = 16384
+tail_bytes = 4096
+max_preview_lines = 12
+
+[providers.openrouter]
+kind = "openrouter"
+base_url = "http://{address}"
+api_key_env = "TEST_OPENROUTER_API_KEY"
+model = "test/model"
+
+[agents.openrouter-api]
+provider = "openrouter"
+prompt_stdin = true
+"#
+        ),
+    )
+    .expect("write provider config");
+
+    let output = Command::cargo_bin("agentctl")
+        .expect("agentctl binary")
+        .current_dir(project_dir.path())
+        .env("HOME", home_dir.path())
+        .env("TEST_OPENROUTER_API_KEY", "test-key")
+        .args([
+            "run",
+            "openrouter-api",
+            "--prompt",
+            "hello provider",
+            "--json",
+        ])
+        .output()
+        .expect("run native provider");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).expect("run JSON");
+    assert!(
+        json[0]["summary"]["preview_lines"]
+            .to_string()
+            .contains("provider-profile-ok")
+    );
+    let request = server.join().expect("mock server");
+    assert!(request.contains("Authorization: Bearer test-key"));
+    assert!(request.contains("\"content\":\"hello provider\""));
 }
 
 #[test]
@@ -276,10 +377,10 @@ agent = "trivial"
 pid = 0
 started_at = 1
 command = "bash -c true"
-cwd = "{}"
+cwd = '{}'
 iterations = 1
-log_path = "{}"
-exit_code_path = "{}"
+log_path = '{}'
+exit_code_path = '{}'
 "#,
             project_dir.path().display(),
             log_path.display(),
@@ -482,4 +583,82 @@ fn assert_key_set(mut actual: Vec<&str>, expected: &[&str]) {
     actual.sort_unstable();
     expected.sort_unstable();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn failed_foreground_run_preserves_reports_and_exit_status() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("agentctl.toml"), r#"
+[agents.fail]
+command = ["python", "-c", "import os,sys; i=int(os.environ['AGENTCTL_AGENT_ITERATION']); print('error: deliberate failure' if i==2 else 'ok'); sys.exit(7 if i==2 else 0)"]
+prompt_stdin = false
+"#).unwrap();
+    let output = Command::cargo_bin("agentctl")
+        .unwrap()
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .args([
+            "run",
+            "fail",
+            "--prompt",
+            "test",
+            "--iterations",
+            "3",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    let reports: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reports.as_array().unwrap().len(), 2);
+    assert_eq!(reports[1]["summary"]["exit_code"], 7);
+    assert!(
+        reports[1]["summary"]["preview_lines"]
+            .to_string()
+            .contains("deliberate failure")
+    );
+    assert!(std::path::Path::new(reports[1]["summary"]["raw_log_path"].as_str().unwrap()).exists());
+}
+
+#[test]
+fn detached_live_job_reports_running_until_completion() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("agentctl.toml"),
+        r#"
+[agents.slow]
+command = ["python", "-c", "import time; time.sleep(2); print('done')"]
+prompt_stdin = false
+"#,
+    )
+    .unwrap();
+    let output = Command::cargo_bin("agentctl")
+        .unwrap()
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .args(["run", "slow", "--prompt", "test", "--detach", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let initial_state = record["state"].clone();
+    let id = record["id"].as_str().unwrap();
+    let output = Command::cargo_bin("agentctl")
+        .unwrap()
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .args(["status", id, "--json"])
+        .output()
+        .unwrap();
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Wait for our worker before deleting its temporary home.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(initial_state, "running");
+    assert_eq!(status["record"]["state"], "running");
 }

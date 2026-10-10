@@ -23,6 +23,7 @@ agentctl config check
 `agentctl` reads `./agentctl.toml` first, then falls back to
 `~/.agentctl/config.toml`. Raw command logs and detached job records live under
 `~/.agentctl/jobs/`.
+On Windows, `USERPROFILE` is used when `HOME` is unset.
 
 ## Wrap a noisy command
 
@@ -52,12 +53,18 @@ handling still works. A failing `cargo test` returns a compact JSON summary:
 The full stdout and stderr remain in `raw_log_path` for later inspection. Use
 `--raw` when you deliberately want the untouched command output streamed back.
 
-Output is streamed to the raw log while only the configured head/tail window is
-retained in memory. Agent commands run in an isolated process group. Interrupting
+Output is streamed to capture files while only the configured head/tail window is
+retained in memory; the complete raw log is assembled when the command finishes.
+On Unix, agent commands run in an isolated process group. Interrupting
 agentctl forwards the signal to the complete command tree, waits for it, and
 terminates descendants left behind by a command that exits early. On Linux,
 agentctl also adopts and reaps orphaned descendants so repeated tool loops do not
-accumulate zombie or live background agent processes.
+accumulate zombie or live background agent processes. Cleanup is scoped to each
+capture, preserving unrelated child processes and concurrent captures in library
+hosts. Linux descendants that leave their process group retain an inherited
+ownership marker for cleanup; this is lifecycle management, not a security sandbox.
+On Windows, commands start suspended and join a Job Object before running, so
+remaining descendants are terminated when the command finishes or its host exits.
 
 ## Run a detached agent task
 
@@ -70,7 +77,7 @@ tail_bytes = 4096
 max_preview_lines = 12
 
 [agents.codex]
-command = ["codex", "exec", "--sandbox", "workspace-write"]
+command = ["codex", "exec", "--sandbox", "danger-full-access"]
 prompt_stdin = true
 
 [agents.claude-code]
@@ -95,7 +102,35 @@ prompt_stdin = true
 [agents.ollama]
 command = ["ollama", "run", "llama3"]
 prompt_stdin = true
+
+# Native OpenRouter Chat Completions provider. The command returns only the key
+# on stdout. agentctl never writes the key to its config or job logs.
+[providers.openrouter]
+kind = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_command = ["op", "read", "op://vault/OPENROUTER_API_KEY/password"]
+model = "openrouter/auto"
+
+# Use the native provider through the normal run command.
+[agents.openrouter-api]
+provider = "openrouter"
+prompt_stdin = true
+
+# Run Pi with its OpenRouter provider instead.
+[agents.openrouter]
+command = ["pi", "--provider", "openrouter", "--model", "openrouter/auto", "--print", "--no-session"]
+prompt_stdin = false
 ```
+
+Use either OpenRouter profile:
+
+```sh
+agentctl run openrouter-api --prompt "Summarize the current design."
+agentctl run openrouter --prompt "Inspect the repository and fix the failing test."
+```
+
+`api_key_env = "OPENROUTER_API_KEY"` is also supported. Set exactly one of
+`api_key_env` and `api_key_command` for each provider.
 
 Start a long task without keeping the caller attached:
 
@@ -110,7 +145,19 @@ agentctl run codex \
 printf 'Run cargo test and summarize the result.' | agentctl run --json
 ```
 
-That returns a job record:
+Codex profiles now default to `--sandbox danger-full-access`, allowing Git staging,
+commits, and branch creation. To opt into the restricted workspace sandbox, use
+`agentctl run --sandbox --prompt "Inspect the project"`. This also works with
+`--detach` and `--iterations`; `.git` remains read-only in that mode. The flag
+requires a profile whose command starts with `codex exec` (including an absolute
+path to Codex). Other runtimes retain their own permission settings.
+
+Existing config files retain their explicit commands. To migrate an older Codex
+profile, change its `workspace-write` argument to `danger-full-access` in
+`agentctl.toml` or `~/.agentctl/config.toml`. Workers still inherit any restrictions
+imposed by the process that launches agentctl.
+
+The detached command returns a job record:
 
 ```json
 {
@@ -121,7 +168,7 @@ That returns a job record:
   "started_at": 1780000000,
   "finished_at": null,
   "exit_code": null,
-  "command": "codex exec --sandbox workspace-write",
+  "command": "codex exec --sandbox danger-full-access",
   "cwd": "/path/to/project",
   "iterations": 1,
   "log_path": "~/.agentctl/jobs/1780000000-1234-codex/output.log"
@@ -138,9 +185,12 @@ agentctl list --json
 
 `logs` is intentionally the raw-output command. `status` and `list` stay bounded
 and machine-readable for agent loops.
+Status reads at most the final 16 KiB of a log, even when a line is very long.
+Raw logs are streamed without requiring valid UTF-8.
 
-Detached supervisors also run in an isolated process group and terminate the
-remaining group after recording their exit status.
+Detached supervisors use isolated process groups on Unix. On Windows they start
+without a console or inherited caller handles, so the caller's output pipes close
+immediately after the launch report.
 
 ## JSON contract
 
@@ -170,6 +220,9 @@ Foreground `run --json` returns an array of iteration reports:
 ]
 ```
 
+If an iteration fails, its report and preceding successful reports are returned,
+further iterations stop, and the CLI exits with the failed command's exit code.
+
 Detached `run --json` and `list --json` use job records:
 
 ```json
@@ -181,7 +234,7 @@ Detached `run --json` and `list --json` use job records:
   "started_at": 1780000000,
   "finished_at": null,
   "exit_code": null,
-  "command": "codex exec --sandbox workspace-write",
+  "command": "codex exec --sandbox danger-full-access",
   "cwd": "/path/to/project",
   "iterations": 1,
   "log_path": "/path/to/output.log"
@@ -206,10 +259,21 @@ These shapes are semver-relevant.
 The crate also exposes the capture, summary, config, and job modules used by the
 CLI. The public API is intentionally small so other local tooling can build the
 same bounded reports without shelling out.
+Embedding applications can call `jobs::launch_detached_with_executable` with the
+path to an installed agentctl binary. `launch_detached` re-executes the current
+binary and is intended for callers that implement agentctl's supervisor command.
 
-## Provider boundary
+## Development
 
-`agentctl` is intentionally a wrapper, not a provider SDK. Codex, Claude Code,
-OpenAI REST, OpenAI websocket/realtime, Ollama, or other provider-specific
-clients live in their own CLIs/scripts. `agentctl` only decides how to pass the
-prompt, capture output, summarize logs, and track detached jobs.
+Run `dev fix` and `dev ci` using the repository's Rust-only `.dev/config.toml`,
+or use Cargo directly. CLI integration tests require Python on `PATH`.
+CI covers Windows and Linux.
+
+## Provider support
+
+`agentctl` includes a native OpenRouter Chat Completions provider. Native
+provider profiles use the same bounded capture, summaries, detached jobs, and
+iteration handling as command profiles.
+
+Other provider-specific clients remain external commands. Configure those
+clients under `agents`, as shown for OpenAI and Ollama above.

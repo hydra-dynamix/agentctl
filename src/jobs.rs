@@ -1,15 +1,18 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::process::ExitStatus;
+#[cfg(not(windows))]
+use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AgentConfig, CONFIG_DIR, SummaryConfig};
 use crate::exec::{CaptureOptions, CapturedRun, ProcessOptions, format_command, run_captured_with};
+#[cfg(not(windows))]
 use crate::process::spawn_detached;
 use crate::summary::{Summary, summarize, summarize_with_command};
 
@@ -109,19 +112,26 @@ pub fn run_foreground(
             summary,
         });
         if exit_code != 0 {
-            bail!(
-                "agent iteration {iteration}/{} exited with code {exit_code}",
-                options.iterations
-            );
+            break;
         }
     }
     Ok(reports)
 }
 
+/// Launch using the current executable's `__supervise` command. Embedders should
+/// use `launch_detached_with_executable` with the path to the agentctl binary.
 pub fn launch_detached(options: &AgentRunOptions) -> Result<JobRecord> {
+    let executable = std::env::current_exe().context("locating agentctl executable")?;
+    launch_detached_with_executable(options, &executable)
+}
+
+pub fn launch_detached_with_executable(
+    options: &AgentRunOptions,
+    executable: &Path,
+) -> Result<JobRecord> {
     validate_options(options)?;
     let started_at = unix_timestamp()?;
-    let job_id = job_id(started_at, &options.agent_name);
+    let job_id = job_id(&options.agent_name);
     let job_dir = jobs_dir()?.join(&job_id);
     fs::create_dir_all(&job_dir).with_context(|| format!("creating {}", job_dir.display()))?;
     let log_path = job_dir.join("output.log");
@@ -130,6 +140,7 @@ pub fn launch_detached(options: &AgentRunOptions) -> Result<JobRecord> {
     let supervisor_path = job_dir.join("supervisor.toml");
     let stdout = fs::File::create(&log_path)
         .with_context(|| format!("creating agent log {}", log_path.display()))?;
+    #[cfg(not(windows))]
     let stderr = stdout
         .try_clone()
         .with_context(|| format!("cloning agent log {}", log_path.display()))?;
@@ -147,21 +158,40 @@ pub fn launch_detached(options: &AgentRunOptions) -> Result<JobRecord> {
     fs::write(&supervisor_path, toml::to_string_pretty(&supervisor)?)
         .with_context(|| format!("writing {}", supervisor_path.display()))?;
 
-    let executable = std::env::current_exe().context("locating agentctl executable")?;
-    let mut command = ProcessCommand::new(executable);
-    command.arg("__supervise").arg(&supervisor_path);
-    command.current_dir(&options.cwd);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::from(stdout));
-    command.stderr(Stdio::from(stderr));
+    #[cfg(windows)]
+    let pid = {
+        drop(stdout);
+        crate::windows_process::spawn_supervisor(
+            executable,
+            &supervisor_path,
+            &options.cwd,
+            &log_path,
+        )?
+    };
+    #[cfg(not(windows))]
+    let pid = {
+        let mut command = ProcessCommand::new(executable);
+        command.arg("__supervise").arg(&supervisor_path);
+        command.current_dir(&options.cwd);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::from(stdout));
+        command.stderr(Stdio::from(stderr));
 
-    let child = spawn_detached(&mut command)
-        .with_context(|| format!("launching detached agent `{}`", format_command(&argv)))?;
+        let child = spawn_detached(&mut command)
+            .with_context(|| format!("launching detached agent `{}`", format_command(&argv)))?;
+        let pid = child.id();
+        // Reap the supervisor when a long-lived library caller outlives it.
+        thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+        pid
+    };
 
     let stored = StoredJobRecord {
         id: job_id,
         agent: options.agent_name.clone(),
-        pid: child.id(),
+        pid,
         started_at,
         command: format_command(&argv),
         cwd: options.cwd.clone(),
@@ -257,14 +287,15 @@ pub fn logs(job_id: &str, follow: bool) -> Result<()> {
     loop {
         let mut file = fs::File::open(&stored.log_path)
             .with_context(|| format!("opening {}", stored.log_path.display()))?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .with_context(|| format!("reading {}", stored.log_path.display()))?;
-        if position < contents.len() {
-            print!("{}", &contents[position..]);
-            std::io::stdout().flush().context("flushing logs")?;
-            position = contents.len();
+        let length = file.metadata()?.len();
+        if length < position {
+            position = 0;
         }
+        file.seek(SeekFrom::Start(position))?;
+        let mut output = std::io::stdout().lock();
+        position += std::io::copy(&mut file.take(length - position), &mut output)?;
+        output.flush().context("flushing logs")?;
+        drop(output);
         if !follow || !matches!(record_from_stored(stored.clone())?.state, JobState::Running) {
             break;
         }
@@ -419,7 +450,18 @@ fn read_job_path(path: &Path) -> Result<StoredJobRecord> {
 }
 
 fn read_tail_lines(path: &Path, tail: usize) -> Result<Vec<String>> {
-    let raw = fs::read_to_string(path).unwrap_or_default();
+    // Bound both IO and the response, even for a log containing one huge line.
+    const MAX_TAIL_BYTES: u64 = 16_384;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("opening job log tail"),
+    };
+    let length = file.metadata()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(MAX_TAIL_BYTES)))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_TAIL_BYTES).read_to_end(&mut bytes)?;
+    let raw = String::from_utf8_lossy(&bytes);
     let mut lines = raw
         .lines()
         .rev()
@@ -431,15 +473,20 @@ fn read_tail_lines(path: &Path, tail: usize) -> Result<Vec<String>> {
 }
 
 fn jobs_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(CONFIG_DIR).join("jobs"))
+    Ok(crate::config::home_dir()?.join(CONFIG_DIR).join("jobs"))
 }
 
-fn job_id(started_at: u64, agent_name: &str) -> String {
+fn job_id(agent_name: &str) -> String {
+    static NEXT_JOB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     format!(
-        "{}-{}-{}",
-        started_at,
+        "{}-{}-{}-{}",
+        timestamp,
         std::process::id(),
+        NEXT_JOB.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         safe_name(agent_name)
     )
 }
@@ -464,23 +511,59 @@ fn unix_timestamp() -> Result<u64> {
         .as_secs())
 }
 
+#[cfg(unix)]
 fn process_is_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    ProcessCommand::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    (unsafe { libc::kill(pid as i32, 0) == 0 })
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let running = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+        CloseHandle(handle);
+        running
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_running(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_tail_bounds_single_lines_and_accepts_non_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("output.log");
+        let mut bytes = vec![b'x'; 1024 * 1024];
+        bytes.extend_from_slice(b"\nlast\xffline\n");
+        fs::write(&path, bytes).unwrap();
+        let tail = read_tail_lines(&path, 2).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert!(tail[1].contains("last"));
+        assert!(tail.iter().map(String::len).sum::<usize>() <= 16_386);
+    }
+
+    #[test]
+    fn detached_job_ids_are_unique_within_one_process() {
+        let ids: std::collections::BTreeSet<_> = (0..1000).map(|_| job_id("same-agent")).collect();
+        assert_eq!(ids.len(), 1000);
+    }
 
     #[test]
     fn stale_job_reports_stale_when_pid_is_dead_and_exit_code_missing() {

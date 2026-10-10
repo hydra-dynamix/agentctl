@@ -33,6 +33,9 @@ enum Command {
         prompt_file: Option<PathBuf>,
         #[arg(long)]
         detach: bool,
+        /// Restrict a Codex worker to workspace writes (Git metadata stays read-only).
+        #[arg(long)]
+        sandbox: bool,
         #[arg(long, default_value_t = 1)]
         iterations: u32,
         #[arg(long)]
@@ -57,7 +60,19 @@ enum Command {
         follow: bool,
     },
     #[command(name = "__supervise", hide = true)]
-    Supervise { spec: PathBuf },
+    Supervise {
+        spec: PathBuf,
+        #[cfg(windows)]
+        #[arg(long)]
+        log: Option<PathBuf>,
+    },
+    #[command(name = "__provider", hide = true)]
+    Provider {
+        config: PathBuf,
+        provider: String,
+        #[arg(long)]
+        model: Option<String>,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -118,6 +133,7 @@ fn main() -> Result<()> {
             prompt,
             prompt_file,
             detach,
+            sandbox,
             iterations,
             cwd,
             json,
@@ -127,6 +143,10 @@ fn main() -> Result<()> {
                 loaded.config.agents.get(&agent).cloned().with_context(|| {
                     format!("unknown agent `{agent}` in {}", loaded.path.display())
                 })?;
+            let mut agent_config = materialize_provider_agent(agent_config, &loaded.path)?;
+            if sandbox {
+                restrict_codex_worker(&mut agent_config.command)?;
+            }
             let prompt = read_prompt(prompt.as_deref(), prompt_file.as_deref())?;
             let cwd = resolve_cwd(agent_config.cwd.as_deref(), cwd.as_deref())?;
             let options = agentctl::jobs::AgentRunOptions {
@@ -155,6 +175,7 @@ fn main() -> Result<()> {
                         print_summary(&report.summary);
                     }
                 }
+                std::process::exit(reports.last().map_or(0, |report| report.summary.exit_code));
             }
         }
         Command::Status { job_id, tail, json } => {
@@ -190,9 +211,39 @@ fn main() -> Result<()> {
         Command::Logs { job_id, follow } => {
             agentctl::jobs::logs(&job_id, follow)?;
         }
-        Command::Supervise { spec } => {
+        Command::Supervise {
+            spec,
+            #[cfg(windows)]
+            log,
+        } => {
+            #[cfg(windows)]
+            let _log = log
+                .as_deref()
+                .map(agentctl::windows_process::redirect_log)
+                .transpose()?;
             let exit_code = agentctl::jobs::supervise(&spec)?;
             std::process::exit(exit_code);
+        }
+        Command::Provider {
+            config,
+            provider,
+            model,
+        } => {
+            let mut prompt = String::new();
+            std::io::stdin()
+                .read_to_string(&mut prompt)
+                .context("reading provider prompt from stdin")?;
+            let config = if config.exists() {
+                agentctl::config::check_path(&config)?
+            } else {
+                agentctl::config::Config::default()
+            };
+            let provider_config = config
+                .providers
+                .get(&provider)
+                .with_context(|| format!("unknown provider `{provider}`"))?;
+            let answer = agentctl::provider::complete(provider_config, model.as_deref(), &prompt)?;
+            println!("{answer}");
         }
         Command::Config { command } => match command {
             ConfigCommand::Generate => {
@@ -209,6 +260,51 @@ fn main() -> Result<()> {
         },
     }
 
+    Ok(())
+}
+
+fn restrict_codex_worker(command: &mut Vec<String>) -> Result<()> {
+    let executable = command
+        .first()
+        .and_then(|value| Path::new(value).file_stem())
+        .and_then(|name| name.to_str());
+    if !executable.is_some_and(|name| name.eq_ignore_ascii_case("codex"))
+        || command.get(1).map(String::as_str) != Some("exec")
+    {
+        bail!("--sandbox requires a profile whose command starts with `codex exec`");
+    }
+
+    let mut restricted = command[..2].to_vec();
+    let mut args = command[2..].iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--" => {
+                restricted.extend(["--sandbox".to_owned(), "workspace-write".to_owned()]);
+                restricted.push(arg.clone());
+                restricted.extend(args.cloned());
+                *command = restricted;
+                return Ok(());
+            }
+            "--sandbox" | "-s" => {
+                args.next()
+                    .context("configured sandbox flag is missing its value")?;
+            }
+            "--dangerously-bypass-approvals-and-sandbox" | "--yolo" | "--full-auto" => {}
+            value if value.starts_with("--sandbox=") || value.starts_with("-s=") => {}
+            // Preserve values verbatim: they may happen to look like flags.
+            "--config" | "-c" | "--model" | "-m" | "--profile" | "-p" => {
+                restricted.push(arg.clone());
+                restricted.push(
+                    args.next()
+                        .context("configured flag is missing its value")?
+                        .clone(),
+                );
+            }
+            _ => restricted.push(arg.clone()),
+        }
+    }
+    restricted.extend(["--sandbox".to_owned(), "workspace-write".to_owned()]);
+    *command = restricted;
     Ok(())
 }
 
@@ -237,6 +333,32 @@ fn read_prompt(prompt: Option<&str>, prompt_file: Option<&Path>) -> Result<Strin
             Ok(input)
         }
     }
+}
+
+fn materialize_provider_agent(
+    mut agent: agentctl::config::AgentConfig,
+    config_path: &Path,
+) -> Result<agentctl::config::AgentConfig> {
+    let Some(provider) = agent.provider.take() else {
+        return Ok(agent);
+    };
+
+    let mut command = vec![
+        std::env::current_exe()
+            .context("locating agentctl executable")?
+            .to_string_lossy()
+            .into_owned(),
+        "__provider".to_owned(),
+        config_path.to_string_lossy().into_owned(),
+        provider,
+    ];
+    if let Some(model) = agent.model.take() {
+        command.push("--model".to_owned());
+        command.push(model);
+    }
+    agent.command = command;
+    agent.prompt_stdin = true;
+    Ok(agent)
 }
 
 fn resolve_cwd(configured: Option<&Path>, override_cwd: Option<&Path>) -> Result<PathBuf> {
@@ -298,5 +420,53 @@ fn print_job_status(status: &agentctl::jobs::JobStatus) {
         for line in &status.tail_lines {
             println!("{line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_replaces_full_access_and_preserves_worker_options() {
+        for flags in [
+            vec!["--sandbox", "danger-full-access"],
+            vec!["-s", "danger-full-access"],
+            vec!["--sandbox=danger-full-access"],
+            vec!["--dangerously-bypass-approvals-and-sandbox"],
+            vec!["--yolo"],
+            vec!["--full-auto"],
+        ] {
+            let mut command: Vec<String> = [
+                vec!["codex", "exec", "--model", "test-model"],
+                flags,
+                vec!["--", "-"],
+            ]
+            .concat()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            restrict_codex_worker(&mut command).unwrap();
+            assert_eq!(
+                command,
+                [
+                    "codex",
+                    "exec",
+                    "--model",
+                    "test-model",
+                    "--sandbox",
+                    "workspace-write",
+                    "--",
+                    "-"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_rejects_unsupported_runtimes() {
+        let mut command = vec!["claude".to_owned(), "-p".to_owned()];
+        assert!(restrict_codex_worker(&mut command).is_err());
+        assert_eq!(command, ["claude", "-p"]);
     }
 }

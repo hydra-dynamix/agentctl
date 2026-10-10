@@ -104,6 +104,11 @@ pub(crate) fn run_captured_with(
         stdin
             .write_all(input)
             .context("writing managed child stdin")?;
+        stdin.flush().context("flushing managed child stdin")?;
+        // Close the pipe before waiting so agents that read until EOF (for
+        // example `cat` or `codex exec`) can finish promptly and do not fall
+        // back to interpreting inherited input in platform-specific ways.
+        drop(stdin);
     }
 
     let status = child
@@ -261,8 +266,7 @@ fn create_raw_log_path(label: Option<&str>) -> Result<PathBuf> {
 }
 
 fn home_jobs_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(CONFIG_DIR).join("jobs"))
+    Ok(crate::config::home_dir()?.join(CONFIG_DIR).join("jobs"))
 }
 
 fn job_id(label: Option<&str>) -> String {

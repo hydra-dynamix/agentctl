@@ -9,4 +9,7 @@ pub mod exec;
 pub mod jobs;
 pub mod output;
 mod process;
+pub mod provider;
 pub mod summary;
+#[cfg(windows)]
+pub mod windows_process;
