@@ -1,12 +1,10 @@
 use std::io;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus};
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::collections::BTreeSet;
-#[cfg(unix)]
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::sync::{Mutex, OnceLock};
 
@@ -17,15 +15,11 @@ use signal_hook::iterator::Signals;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 const TERMINATION_GRACE: Duration = Duration::from_millis(750);
 
 #[cfg(unix)]
 static ACTIVE_PROCESS_GROUPS: Mutex<BTreeSet<i32>> = Mutex::new(BTreeSet::new());
-#[cfg(unix)]
-static NEXT_OWNER: AtomicU64 = AtomicU64::new(0);
-#[cfg(unix)]
-const OWNER_ENV: &str = "AGENTCTL_PROCESS_OWNER";
 #[cfg(unix)]
 static SIGNAL_FORWARDER: OnceLock<()> = OnceLock::new();
 
@@ -37,8 +31,6 @@ pub(crate) struct ManagedChild {
     child: Child,
     #[cfg(unix)]
     process_group: i32,
-    #[cfg(unix)]
-    owner: String,
     #[cfg(windows)]
     job: crate::windows_process::Job,
     reaped: bool,
@@ -54,17 +46,10 @@ pub(crate) fn spawn_detached(command: &mut Command) -> io::Result<Child> {
 
 impl ManagedChild {
     pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
-        enable_subreaper()?;
         configure_process_group(command);
         install_signal_forwarder()?;
-        #[cfg(unix)]
-        let owner = format!(
-            "{}-{}",
-            std::process::id(),
-            NEXT_OWNER.fetch_add(1, Ordering::Relaxed)
-        );
-        #[cfg(unix)]
-        command.env(OWNER_ENV, &owner);
+        #[cfg(target_os = "linux")]
+        crate::linux_process::configure_supervisor(command)?;
         // Serialize spawn/registration against signal forwarding.
         #[cfg(unix)]
         let mut active = ACTIVE_PROCESS_GROUPS
@@ -82,7 +67,6 @@ impl ManagedChild {
             Ok(Self {
                 child,
                 process_group,
-                owner,
                 reaped: false,
             })
         }
@@ -117,8 +101,8 @@ impl ManagedChild {
     }
 
     fn clean_remaining_descendants(&self) {
-        #[cfg(unix)]
-        terminate_process_tree(self.process_group, &self.owner);
+        #[cfg(all(unix, not(target_os = "linux")))]
+        terminate_process_tree(self.process_group);
         #[cfg(windows)]
         self.job.terminate();
     }
@@ -140,8 +124,12 @@ impl Drop for ManagedChild {
             return;
         }
 
-        #[cfg(unix)]
-        terminate_process_tree(self.process_group, &self.owner);
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::kill(self.process_group, SIGTERM);
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        terminate_process_tree(self.process_group);
         #[cfg(windows)]
         self.job.terminate();
         #[cfg(not(any(unix, windows)))]
@@ -192,122 +180,94 @@ fn install_signal_forwarder() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn enable_subreaper() -> io::Result<()> {
-    let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn enable_subreaper() -> io::Result<()> {
-    Ok(())
-}
-
 #[cfg(not(unix))]
 fn install_signal_forwarder() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn terminate_process_tree(process_group: i32, owner: &str) {
-    if process_group <= 0 {
-        return;
-    }
-    let mut descendants = BTreeSet::new();
+#[cfg(all(unix, not(target_os = "linux")))]
+fn terminate_process_tree(process_group: i32) {
     for signal in [SIGTERM, libc::SIGKILL] {
+        unsafe {
+            libc::kill(-process_group, signal);
+        }
         let deadline = Instant::now() + TERMINATION_GRACE;
-        loop {
-            collect_owned_descendants(process_group, owner, &mut descendants);
-            unsafe {
-                libc::kill(-process_group, signal);
-            }
-            for &pid in &descendants {
-                unsafe {
-                    libc::kill(pid, signal);
-                }
-            }
-            // Do not consume the direct child's ExitStatus or any unrelated
-            // child's wait status. Retain known PIDs until reaped, since a
-            // zombie no longer exposes its environment ownership marker.
-            descendants.retain(|&pid| {
-                let mut status = 0;
-                let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-                result != pid && (unsafe { libc::kill(pid, 0) } == 0)
-            });
-            if !process_group_exists(process_group) && descendants.is_empty() {
+        while Instant::now() < deadline {
+            if unsafe { libc::kill(-process_group, 0) } != 0 {
                 return;
-            }
-            if Instant::now() >= deadline {
-                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
 
-#[cfg(unix)]
-fn process_group_exists(process_group: i32) -> bool {
-    if unsafe { libc::kill(-process_group, 0) } == 0 {
-        return true;
-    }
-    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-// A subreaper can also adopt unrelated host children. Restrict cleanup to
-// this process group or its inherited ownership marker, which survives setsid.
-#[cfg(target_os = "linux")]
-fn collect_owned_descendants(group: i32, owner: &str, descendants: &mut BTreeSet<i32>) {
-    let marker = format!("{OWNER_ENV}={owner}");
-    let mut pending: Vec<i32> = linux_child_pids(std::process::id() as i32)
-        .into_iter()
-        .filter(|&pid| {
-            if pid == group {
-                return false;
-            }
-            let same_group = unsafe { libc::getpgid(pid) } == group;
-            same_group
-                || std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| {
-                    env.split(|byte| *byte == 0)
-                        .any(|entry| entry == marker.as_bytes())
-                })
-        })
-        .collect();
-    while let Some(pid) = pending.pop() {
-        if descendants.insert(pid) {
-            pending.extend(linux_child_pids(pid));
-        }
-    }
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn collect_owned_descendants(_group: i32, _owner: &str, _descendants: &mut BTreeSet<i32>) {}
-
-#[cfg(target_os = "linux")]
-fn linux_child_pids(pid: i32) -> Vec<i32> {
-    let mut children = BTreeSet::new();
-    if let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) {
-        for task in tasks.flatten() {
-            if let Ok(raw) = std::fs::read_to_string(task.path().join("children")) {
-                children.extend(
-                    raw.split_whitespace()
-                        .filter_map(|value| value.parse::<i32>().ok()),
-                );
-            }
-        }
-    }
-    children.into_iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use super::*;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     use std::process::Stdio;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capture_survives_spawning_thread_exit() {
+        let mut managed = std::thread::spawn(|| {
+            let mut command = Command::new("sleep");
+            command.arg("0.1");
+            ManagedChild::spawn(&mut command).unwrap()
+        })
+        .join()
+        .unwrap();
+        assert!(managed.wait().unwrap().success());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn supervisor_reaps_escaped_children_without_environment_markers() {
+        for zombie in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let pid_file = temp.path().join("child.pid");
+            let escaped = if zombie {
+                "import os,sys; os.setsid(); open(sys.argv[1], 'w').write(str(os.getpid()))"
+            } else {
+                "import os,sys,signal,time; os.setsid(); signal.signal(signal.SIGTERM, signal.SIG_IGN); open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)"
+            };
+            let script = "import os,sys,time; pid=os.fork(); (os.execve(sys.executable,[sys.executable,'-c',sys.argv[2],sys.argv[1]],{}) if pid==0 else None); time.sleep(0.3)";
+            let mut command = Command::new("python");
+            command
+                .args(["-c", script])
+                .arg(&pid_file)
+                .arg(escaped)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut managed = ManagedChild::spawn(&mut command).unwrap();
+            assert!(managed.wait().unwrap().success());
+            let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+            let survived = unsafe { libc::kill(pid, 0) } == 0;
+            if survived {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            assert!(!survived, "escaped child remained (zombie={zombie})");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn supervisor_preserves_exec_errors_and_host_subreaper_setting() {
+        let mut before: libc::c_int = 0;
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut before), 0);
+        }
+        let error = ManagedChild::spawn(&mut Command::new("/agentctl-nonexistent-executable"));
+        assert!(matches!(error, Err(ref error) if error.kind() == io::ErrorKind::NotFound));
+        let mut after: libc::c_int = 0;
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut after), 0);
+        }
+        assert_eq!(before, after, "library changed the host subreaper setting");
+    }
 
     #[test]
     #[cfg(windows)]
@@ -360,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn wait_terminates_descendants_left_by_the_direct_child() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pid_path = temp.path().join("descendant.pid");

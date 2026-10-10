@@ -13,3 +13,6 @@ pub mod provider;
 pub mod summary;
 #[cfg(windows)]
 pub mod windows_process;
+
+#[cfg(target_os = "linux")]
+mod linux_process;

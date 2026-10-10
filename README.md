@@ -61,8 +61,10 @@ terminates descendants left behind by a command that exits early. On Linux,
 agentctl also adopts and reaps orphaned descendants so repeated tool loops do not
 accumulate zombie or live background agent processes. Cleanup is scoped to each
 capture, preserving unrelated child processes and concurrent captures in library
-hosts. Linux descendants that leave their process group retain an inherited
-ownership marker for cleanup; this is lifecycle management, not a security sandbox.
+hosts. Each Linux capture has a dedicated subreaper supervisor, so descendants
+remain owned even after changing session, clearing their environment, or exiting
+before cleanup. The embedding application is never made a subreaper. This is
+lifecycle management, not a security sandbox.
 On Windows, commands start suspended and join a Job Object before running, so
 remaining descendants are terminated when the command finishes or its host exits.
 
@@ -267,7 +269,8 @@ binary and is intended for callers that implement agentctl's supervisor command.
 
 Run `dev fix` and `dev ci` using the repository's Rust-only `.dev/config.toml`,
 or use Cargo directly. CLI integration tests require Python on `PATH`.
-CI covers Windows and Linux.
+CI is configured for Windows, Linux, and macOS. Linux-only subreaper tests are
+separate from the portable command, provider, and detached-job tests.
 
 ## Provider support
 

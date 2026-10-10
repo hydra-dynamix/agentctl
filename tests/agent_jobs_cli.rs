@@ -275,7 +275,7 @@ fn detached_trivial_agent_round_trips_run_status_logs() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn detached_supervisor_reaps_descendants_that_create_a_new_session() {
     let home_dir = tempfile::tempdir().expect("home tempdir");
     let project_dir = tempfile::tempdir().expect("project tempdir");
@@ -441,7 +441,7 @@ fn foreground_agent_accepts_prompt_file_and_cwd_override() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn terminating_foreground_agentctl_terminates_and_reaps_the_agent_tree() {
     use std::os::unix::process::ExitStatusExt;
 
@@ -661,4 +661,40 @@ prompt_stdin = false
     std::thread::sleep(std::time::Duration::from_secs(3));
     assert_eq!(initial_state, "running");
     assert_eq!(status["record"]["state"], "running");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn killed_host_still_cleans_escaped_descendants() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let pid_file = project.path().join("escaped.pid");
+    let mut host = std::process::Command::new(assert_cmd::cargo::cargo_bin!("agentctl"))
+        .current_dir(project.path()).env("HOME", home.path())
+        .args(["exec", "--", "python", "-c", "import os,sys,time; os.setsid(); open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(30)"])
+        .arg(&pid_file).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn().unwrap();
+    for _ in 0..200 {
+        if pid_file.exists() && std::fs::metadata(&pid_file).unwrap().len() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+    host.kill().unwrap();
+    host.wait().unwrap();
+    let mut survived = true;
+    for _ in 0..300 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            survived = false;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if survived {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    assert!(!survived, "worker survived the host's SIGKILL");
 }
