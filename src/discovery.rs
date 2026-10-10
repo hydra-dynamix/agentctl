@@ -356,7 +356,7 @@ fn agent_statuses(config: &Config) -> Vec<AgentStatus> {
             AgentStatus {
                 name: name.clone(),
                 command: agent.command.clone(),
-                available: executable.is_some(),
+                available: agent.provider.is_some() || executable.is_some(),
                 executable,
             }
         })
@@ -451,11 +451,12 @@ fn agent_available<F>(agent: &AgentConfig, lookup: &F) -> bool
 where
     F: Fn(&str) -> Option<PathBuf>,
 {
-    agent
-        .command
-        .first()
-        .and_then(|command| lookup(command))
-        .is_some()
+    agent.provider.is_some()
+        || agent
+            .command
+            .first()
+            .and_then(|command| lookup(command))
+            .is_some()
 }
 
 fn unavailable_agent_warning(name: &str, agent: &AgentConfig) -> String {
@@ -598,6 +599,8 @@ mod tests {
                         command: vec![(*command).to_owned()],
                         prompt_stdin: true,
                         cwd: None,
+                        provider: None,
+                        model: None,
                     },
                 )
             })

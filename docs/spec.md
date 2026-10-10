@@ -91,7 +91,25 @@ prompt_stdin = true
 [agents.claude]
 command = ["claude", "-p"]
 prompt_stdin = false         # prompt appended as final arg
+
+[providers.openrouter]
+kind = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openrouter/auto"
+
+[agents.openrouter-api]
+provider = "openrouter"      # native HTTP provider
+prompt_stdin = true
+
+[agents.openrouter]
+command = ["pi", "--provider", "openrouter", "--model", "openrouter/auto", "--print", "--no-session"]
+prompt_stdin = false
 ```
+
+A provider can resolve its key from `api_key_env` or `api_key_command`. The key
+is never stored in job records or logs. OpenRouter uses its Chat Completions
+endpoint. Other provider clients remain external commands.
 
 Job records and raw logs live under `~/.agentctl/jobs/<job-id>/`
 (`job.toml`, `output.log`, `exit-code`).
@@ -150,5 +168,6 @@ above verified.
 ## Out of scope
 
 - Publishing (user-triggered).
+- Native provider APIs other than OpenRouter.
 - MCP server mode, daemon mode, TUI — maybe later; do not scaffold for them.
 - devkit integration (devkit removes its agent/summary commands separately).

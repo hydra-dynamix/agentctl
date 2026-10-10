@@ -150,3 +150,39 @@ fn assert_key_set(mut actual: Vec<&str>, expected: &[&str]) {
     expected.sort_unstable();
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn external_summarizer_respects_output_limits() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("agentctl.toml"), r#"
+[summary]
+max_output_bytes = 256
+tail_bytes = 64
+max_preview_lines = 2
+summarizer_command = ["python", "-c", "import sys; sys.stdin.read(); print('summary-line\\n'*100000)"]
+"#).unwrap();
+    let output = Command::cargo_bin("agentctl")
+        .unwrap()
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .args(["exec", "--json", "--", "python", "-c", "print('hello')"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let lines = summary["preview_lines"].as_array().unwrap();
+    assert_eq!(lines[0], "summary-line");
+    assert!(lines.len() <= 2);
+    assert!(
+        lines
+            .iter()
+            .map(|line| line.as_str().unwrap().len())
+            .sum::<usize>()
+            <= 256
+    );
+}

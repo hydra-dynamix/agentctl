@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub summary: SummaryConfig,
     #[serde(default)]
+    pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(default)]
     pub agents: BTreeMap<String, AgentConfig>,
 }
 
@@ -30,10 +32,35 @@ pub struct SummaryConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
+    #[serde(default)]
     pub prompt_stdin: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    #[serde(default)]
+    pub kind: ProviderKind,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_command: Option<Vec<String>>,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    #[default]
+    Openrouter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +71,25 @@ pub struct LoadedConfig {
 
 impl Default for Config {
     fn default() -> Self {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "openrouter".to_owned(),
+            ProviderConfig {
+                kind: ProviderKind::Openrouter,
+                base_url: "https://openrouter.ai/api/v1".to_owned(),
+                api_key_env: Some("OPENROUTER_API_KEY".to_owned()),
+                api_key_command: None,
+                model: "openrouter/auto".to_owned(),
+            },
+        );
+
+        let command_agent = |command: Vec<String>, prompt_stdin| AgentConfig {
+            command,
+            prompt_stdin,
+            cwd: None,
+            provider: None,
+            model: None,
+        };
         let mut agents = BTreeMap::new();
         agents.insert(
             "pi".to_owned(),
@@ -51,52 +97,37 @@ impl Default for Config {
                 command: vec!["pi".to_owned(), "-p".to_owned()],
                 prompt_stdin: false,
                 cwd: None,
+                provider: None,
+                model: None,
             },
         );
         agents.insert(
             "codex".to_owned(),
-            AgentConfig {
-                command: vec![
+            command_agent(
+                vec![
                     "codex".to_owned(),
                     "exec".to_owned(),
                     "--sandbox".to_owned(),
                     "danger-full-access".to_owned(),
                 ],
-                prompt_stdin: true,
-                cwd: None,
-            },
+                true,
+            ),
         );
         agents.insert(
             "claude-code".to_owned(),
-            AgentConfig {
-                command: vec!["claude".to_owned(), "-p".to_owned()],
-                prompt_stdin: false,
-                cwd: None,
-            },
+            command_agent(vec!["claude".to_owned(), "-p".to_owned()], false),
         );
         agents.insert(
             "claude".to_owned(),
-            AgentConfig {
-                command: vec!["claude".to_owned(), "-p".to_owned()],
-                prompt_stdin: false,
-                cwd: None,
-            },
+            command_agent(vec!["claude".to_owned(), "-p".to_owned()], false),
         );
         agents.insert(
             "openai-rest".to_owned(),
-            AgentConfig {
-                command: vec!["openai-rest-agent".to_owned()],
-                prompt_stdin: true,
-                cwd: None,
-            },
+            command_agent(vec!["openai-rest-agent".to_owned()], true),
         );
         agents.insert(
             "openai-websocket".to_owned(),
-            AgentConfig {
-                command: vec!["openai-websocket-agent".to_owned()],
-                prompt_stdin: true,
-                cwd: None,
-            },
+            command_agent(vec!["openai-websocket-agent".to_owned()], true),
         );
         agents.insert(
             "openclaw".to_owned(),
@@ -104,6 +135,8 @@ impl Default for Config {
                 command: vec!["openclaw".to_owned(), "run".to_owned()],
                 prompt_stdin: false,
                 cwd: None,
+                provider: None,
+                model: None,
             },
         );
         agents.insert(
@@ -112,19 +145,46 @@ impl Default for Config {
                 command: vec!["opencode".to_owned(), "run".to_owned()],
                 prompt_stdin: false,
                 cwd: None,
+                provider: None,
+                model: None,
             },
         );
         agents.insert(
             "ollama".to_owned(),
+            command_agent(
+                vec!["ollama".to_owned(), "run".to_owned(), "llama3".to_owned()],
+                true,
+            ),
+        );
+        agents.insert(
+            "openrouter-api".to_owned(),
             AgentConfig {
-                command: vec!["ollama".to_owned(), "run".to_owned(), "llama3".to_owned()],
+                command: Vec::new(),
                 prompt_stdin: true,
                 cwd: None,
+                provider: Some("openrouter".to_owned()),
+                model: None,
             },
+        );
+        agents.insert(
+            "openrouter".to_owned(),
+            command_agent(
+                vec![
+                    "pi".to_owned(),
+                    "--provider".to_owned(),
+                    "openrouter".to_owned(),
+                    "--model".to_owned(),
+                    "openrouter/auto".to_owned(),
+                    "--print".to_owned(),
+                    "--no-session".to_owned(),
+                ],
+                false,
+            ),
         );
 
         Self {
             summary: SummaryConfig::default(),
+            providers,
             agents,
         }
     }
@@ -216,12 +276,49 @@ pub fn validate(config: &Config) -> Result<()> {
         bail!("summary.summarizer_command must not be empty when set");
     }
 
+    for (name, provider) in &config.providers {
+        if provider.base_url.trim().is_empty() {
+            bail!("providers.{name}.base_url must not be empty");
+        }
+        if provider.model.trim().is_empty() {
+            bail!("providers.{name}.model must not be empty");
+        }
+        match (&provider.api_key_env, &provider.api_key_command) {
+            (Some(environment), None) if environment.trim().is_empty() => {
+                bail!("providers.{name}.api_key_env must not be empty")
+            }
+            (None, Some(command)) if command.is_empty() => {
+                bail!("providers.{name}.api_key_command must not be empty")
+            }
+            (None, Some(command)) if command.iter().any(|part| part.trim().is_empty()) => {
+                bail!("providers.{name}.api_key_command must not contain empty arguments")
+            }
+            (Some(_), Some(_)) => {
+                bail!("providers.{name} must set only one of api_key_env or api_key_command")
+            }
+            (None, None) => {
+                bail!("providers.{name} must set one of api_key_env or api_key_command")
+            }
+            _ => {}
+        }
+    }
+
     for (name, agent) in &config.agents {
-        if agent.command.is_empty() {
-            bail!("agents.{name}.command must not be empty");
+        match (agent.command.is_empty(), agent.provider.as_deref()) {
+            (true, None) => bail!("agents.{name} must set command or provider"),
+            (false, Some(_)) => bail!("agents.{name} must not set both command and provider"),
+            _ => {}
         }
         if agent.command.iter().any(|part| part.trim().is_empty()) {
             bail!("agents.{name}.command must not contain empty arguments");
+        }
+        if let Some(provider) = &agent.provider
+            && !config.providers.contains_key(provider)
+        {
+            bail!("agents.{name}.provider references unknown provider `{provider}`");
+        }
+        if agent.provider.is_none() && agent.model.is_some() {
+            bail!("agents.{name}.model requires agents.{name}.provider");
         }
     }
 
@@ -296,6 +393,7 @@ mod tests {
                 max_preview_lines: 12,
                 summarizer_command: None,
             },
+            providers: Config::default().providers,
             agents: BTreeMap::new(),
         };
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5 - 2026-10-10
+
+- Add native OpenRouter-compatible Chat Completions profiles with environment or command-based API keys.
+- Give each Linux capture a dedicated subreaper, preserving host process ownership while cleaning detached descendants and zombies.
+- Assign Windows workers to Job Objects before execution and prevent detached supervisors from holding caller output pipes open.
+- Preserve failed foreground reports and exit codes, bound external summaries and status tails, and prevent detached job ID collisions.
+- Retain discovery, Core compatibility, and durable error capture; validate provider execution against a live compatible endpoint.
+
 ## 0.1.4 - 2026-09-17
 
 - Reap successfully exited adopted descendants throughout active Linux agent runs instead of retaining them as zombies until the direct agent exits.

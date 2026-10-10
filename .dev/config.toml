@@ -1,0 +1,27 @@
+default_language = "rust"
+
+[tasks.rust_fmt]
+commands = [["cargo", "fmt"]]
+
+[tasks.rust_fmt_check]
+commands = [["cargo", "fmt", "--", "--check"]]
+
+[tasks.rust_lint]
+commands = [["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]]
+
+[tasks.rust_test]
+commands = [["cargo", "test", "--all-targets"]]
+
+[tasks.rust_ci]
+commands = ["rust_fmt_check", "rust_lint", "rust_test"]
+
+[languages.rust]
+install = []
+
+[languages.rust.pipelines]
+fmt = ["rust_fmt"]
+lint = ["rust_lint"]
+test = ["rust_test"]
+fix = ["rust_fmt"]
+check = ["rust_ci"]
+ci = ["rust_ci"]

@@ -63,7 +63,19 @@ enum Command {
         follow: bool,
     },
     #[command(name = "__supervise", hide = true)]
-    Supervise { spec: PathBuf },
+    Supervise {
+        spec: PathBuf,
+        #[cfg(windows)]
+        #[arg(long)]
+        log: Option<PathBuf>,
+    },
+    #[command(name = "__provider", hide = true)]
+    Provider {
+        config: PathBuf,
+        provider: String,
+        #[arg(long)]
+        model: Option<String>,
+    },
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -153,6 +165,7 @@ fn main() -> Result<()> {
                         )
                     })?;
                 }
+                resolved.agent = materialize_provider_agent(resolved.agent, &loaded.path)?;
                 if sandbox {
                     restrict_codex_worker(&mut resolved.agent.command)?;
                 }
@@ -215,6 +228,7 @@ fn main() -> Result<()> {
                         print_summary(&report.summary);
                     }
                 }
+                std::process::exit(reports.last().map_or(0, |report| report.summary.exit_code));
             }
         }
         Command::Status { job_id, tail, json } => {
@@ -250,9 +264,39 @@ fn main() -> Result<()> {
         Command::Logs { job_id, follow } => {
             agentctl::jobs::logs(&job_id, follow)?;
         }
-        Command::Supervise { spec } => {
+        Command::Supervise {
+            spec,
+            #[cfg(windows)]
+            log,
+        } => {
+            #[cfg(windows)]
+            let _log = log
+                .as_deref()
+                .map(agentctl::windows_process::redirect_log)
+                .transpose()?;
             let exit_code = agentctl::jobs::supervise(&spec)?;
             std::process::exit(exit_code);
+        }
+        Command::Provider {
+            config,
+            provider,
+            model,
+        } => {
+            let mut prompt = String::new();
+            std::io::stdin()
+                .read_to_string(&mut prompt)
+                .context("reading provider prompt from stdin")?;
+            let config = if config.exists() {
+                agentctl::config::check_path(&config)?
+            } else {
+                agentctl::config::Config::default()
+            };
+            let provider_config = config
+                .providers
+                .get(&provider)
+                .with_context(|| format!("unknown provider `{provider}`"))?;
+            let answer = agentctl::provider::complete(provider_config, model.as_deref(), &prompt)?;
+            println!("{answer}");
         }
         Command::Config { command } => match command {
             ConfigCommand::Generate => {
@@ -350,6 +394,32 @@ fn read_prompt(prompt: Option<&str>, prompt_file: Option<&Path>) -> Result<Strin
             Ok(input)
         }
     }
+}
+
+fn materialize_provider_agent(
+    mut agent: agentctl::config::AgentConfig,
+    config_path: &Path,
+) -> Result<agentctl::config::AgentConfig> {
+    let Some(provider) = agent.provider.take() else {
+        return Ok(agent);
+    };
+
+    let mut command = vec![
+        std::env::current_exe()
+            .context("locating agentctl executable")?
+            .to_string_lossy()
+            .into_owned(),
+        "__provider".to_owned(),
+        config_path.to_string_lossy().into_owned(),
+        provider,
+    ];
+    if let Some(model) = agent.model.take() {
+        command.push("--model".to_owned());
+        command.push(model);
+    }
+    agent.command = command;
+    agent.prompt_stdin = true;
+    Ok(agent)
 }
 
 fn resolve_cwd(configured: Option<&Path>, override_cwd: Option<&Path>) -> Result<PathBuf> {

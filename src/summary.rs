@@ -1,12 +1,10 @@
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command as ProcessCommand, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::config::SummaryConfig;
-use crate::exec::{CapturedRun, format_command};
+use crate::exec::{CaptureOptions, CapturedRun, ProcessOptions, format_command, run_captured_with};
 use crate::output::{bounded_output, combine_output};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -67,38 +65,28 @@ pub fn summarize_with_command(
         bounded
     );
 
-    let mut child = ProcessCommand::new(&summarizer_argv[0])
-        .args(&summarizer_argv[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "starting summary command `{}`",
-                format_command(summarizer_argv)
-            )
-        })?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .context("writing prompt to summary command")?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .context("waiting for summary command")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let output = run_captured_with(
+        summarizer_argv,
+        &CaptureOptions {
+            max_output_bytes: config.max_output_bytes,
+            tail_bytes: config.tail_bytes,
+            label: Some("summarizer".to_owned()),
+            stream_raw: false,
+        },
+        &ProcessOptions {
+            stdin: Some(prompt.into_bytes()),
+            ..ProcessOptions::default()
+        },
+    )?;
+    if !output.exit_status.success() {
         bail!(
             "summary command exited with {}: {}",
-            output.status.code().unwrap_or(1),
-            stderr.trim()
+            output.exit_status.code().unwrap_or(1),
+            output.stderr.trim()
         );
     }
 
-    let summary_text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let summary_text = output.stdout.trim();
     if summary_text.is_empty() {
         return Ok(summarize(run, config));
     }
@@ -107,7 +95,11 @@ pub fn summarize_with_command(
         command: format_command(&run.command),
         exit_code: exit_code(run),
         duration_ms: run.elapsed.as_millis(),
-        preview_lines: summary_text.lines().map(str::to_owned).collect(),
+        preview_lines: summary_text
+            .lines()
+            .take(config.max_preview_lines)
+            .map(str::to_owned)
+            .collect(),
         raw_log_path: run.raw_log_path.clone(),
     })
 }

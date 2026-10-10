@@ -106,6 +106,11 @@ pub(crate) fn run_captured_with(
         stdin
             .write_all(input)
             .context("writing managed child stdin")?;
+        stdin.flush().context("flushing managed child stdin")?;
+        // Close the pipe before waiting so agents that read until EOF (for
+        // example `cat` or `codex exec`) can finish promptly and do not fall
+        // back to interpreting inherited input in platform-specific ways.
+        drop(stdin);
     }
 
     let status = child
