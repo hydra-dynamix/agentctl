@@ -5,6 +5,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRepository {
+    pub root: PathBuf,
+    pub name_with_owner: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestContext {
     pub repository_root: PathBuf,
     pub repository: String,
@@ -12,12 +18,6 @@ pub struct PullRequestContext {
     pub url: String,
     pub title: String,
     pub head_sha: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Repository {
-    #[serde(rename = "nameWithOwner")]
-    name_with_owner: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,32 +35,46 @@ struct PullRequestHead {
     sha: String,
 }
 
-pub fn resolve_pull_request(cwd: &Path) -> Result<PullRequestContext> {
-    let root = command_text(cwd, "git", &["rev-parse", "--show-toplevel"])?;
-    let repository_root = PathBuf::from(root.trim());
-    if !repository_root.is_absolute() {
+pub fn resolve_git_repository(cwd: &Path) -> Result<GitRepository> {
+    let root = command_text(cwd, "git", &["rev-parse", "--show-toplevel"], None)?;
+    let root = PathBuf::from(root.trim());
+    if !root.is_absolute() {
         bail!("git returned a non-absolute repository root");
     }
-    let head_sha = command_text(&repository_root, "git", &["rev-parse", "HEAD"])?
+    let origin = command_text(&root, "git", &["remote", "get-url", "origin"], None)?;
+    let name_with_owner = repository_from_origin(origin.trim())?;
+    Ok(GitRepository {
+        root,
+        name_with_owner,
+    })
+}
+
+pub fn resolve_pull_request(cwd: &Path) -> Result<PullRequestContext> {
+    let repository = resolve_git_repository(cwd)?;
+    resolve_pull_request_for(&repository, None)
+}
+
+pub fn resolve_pull_request_for(
+    repository: &GitRepository,
+    github_token: Option<&str>,
+) -> Result<PullRequestContext> {
+    let head_sha = command_text(&repository.root, "git", &["rev-parse", "HEAD"], None)?
         .trim()
         .to_owned();
     if head_sha.is_empty() {
         bail!("git returned an empty HEAD commit");
     }
-
-    let repository: Repository = serde_json::from_str(&command_text(
-        &repository_root,
-        "gh",
-        &["repo", "view", "--json", "nameWithOwner"],
-    )?)
-    .context("parsing repository information from `gh repo view`")?;
     let endpoint = format!(
         "repos/{}/commits/{head_sha}/pulls",
         repository.name_with_owner
     );
-    let pulls: Vec<PullRequest> =
-        serde_json::from_str(&command_text(&repository_root, "gh", &["api", &endpoint])?)
-            .context("parsing pull requests associated with HEAD from `gh api`")?;
+    let pulls: Vec<PullRequest> = serde_json::from_str(&command_text(
+        &repository.root,
+        "gh",
+        &["api", &endpoint],
+        github_token,
+    )?)
+    .context("parsing pull requests associated with HEAD from `gh api`")?;
     let mut matching = pulls
         .into_iter()
         .filter(|pull| pull.state.eq_ignore_ascii_case("open") && pull.head.sha == head_sha);
@@ -72,8 +86,8 @@ pub fn resolve_pull_request(cwd: &Path) -> Result<PullRequestContext> {
     }
 
     Ok(PullRequestContext {
-        repository_root,
-        repository: repository.name_with_owner,
+        repository_root: repository.root.clone(),
+        repository: repository.name_with_owner.clone(),
         number: pull.number,
         url: pull.url,
         title: pull.title,
@@ -151,10 +165,42 @@ Finish by reporting the review action, findings, confidence score, and whether a
     ))
 }
 
-fn command_text(cwd: &Path, program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
+fn repository_from_origin(origin: &str) -> Result<String> {
+    let path = if let Some((_, path)) = origin.rsplit_once(':')
+        && !origin.contains("://")
+    {
+        path
+    } else {
+        origin
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(origin)
+            .split_once('/')
+            .map(|(_, path)| path)
+            .context("Git origin URL does not contain an owner and repository")?
+    };
+    let path = path.trim_matches('/').strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+        bail!("Git origin URL does not identify one owner/repository pair");
+    }
+    Ok(format!("{owner}/{name}"))
+}
+
+fn command_text(
+    cwd: &Path,
+    program: &str,
+    args: &[&str],
+    github_token: Option<&str>,
+) -> Result<String> {
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    if let Some(token) = github_token {
+        command.env("GH_TOKEN", token).env_remove("GITHUB_TOKEN");
+    }
+    let output = command
         .output()
         .with_context(|| format!("running `{program} {}`", args.join(" ")))?;
     if !output.status.success() {
@@ -200,6 +246,22 @@ mod tests {
     fn requirements_path_must_be_absolute() {
         let error = read_requirements(Some(Path::new("spec.md"))).unwrap_err();
         assert!(error.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn parses_common_github_origin_urls() {
+        assert_eq!(
+            repository_from_origin("https://github.com/owner/project.git").unwrap(),
+            "owner/project"
+        );
+        assert_eq!(
+            repository_from_origin("git@github.com:owner/project.git").unwrap(),
+            "owner/project"
+        );
+        assert_eq!(
+            repository_from_origin("ssh://git@github.com/owner/project.git").unwrap(),
+            "owner/project"
+        );
     }
 
     #[test]

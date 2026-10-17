@@ -175,16 +175,29 @@ fn main() -> Result<()> {
         } => {
             let attempt = agentctl::capture::ExecutionAttempt::begin(Path::new("."), "pr-review")?;
             let initialized = (|| -> Result<_> {
-                let context = agentctl::task::resolve_pull_request(Path::new("."))?;
+                let loaded = agentctl::config::check().with_context(|| {
+                    "Agentctl configuration is invalid; run `agentctl discover` for recovery options"
+                })?;
+                let repository = agentctl::task::resolve_git_repository(Path::new("."))?;
+                let github_token = loaded
+                    .config
+                    .github_app
+                    .as_ref()
+                    .map(|config| {
+                        agentctl::github_app::installation_token(
+                            config,
+                            &repository.name_with_owner,
+                        )
+                    })
+                    .transpose()?;
+                let context =
+                    agentctl::task::resolve_pull_request_for(&repository, github_token.as_deref())?;
                 let requirements = agentctl::task::read_requirements(requirements.as_deref())?;
                 let prompt = agentctl::task::pr_review_prompt(
                     &context,
                     requirements.as_ref(),
                     confidence_threshold,
                 )?;
-                let loaded = agentctl::config::check().with_context(|| {
-                    "Agentctl configuration is invalid; run `agentctl discover` for recovery options"
-                })?;
                 let mut resolved =
                     agentctl::discovery::resolve_agent(&loaded, agent.as_deref(), !no_fallback)?;
                 if resolved.name.starts_with("ldgr-loop") || resolved.name == "ldgr-summary" {
@@ -195,17 +208,30 @@ fn main() -> Result<()> {
                     })?;
                 }
                 resolved.agent = materialize_provider_agent(resolved.agent, &loaded.path)?;
-                Ok((loaded, resolved, prompt, context.repository_root))
+                let detached_github_auth = loaded
+                    .config
+                    .github_app
+                    .as_ref()
+                    .map(|config| (config.clone(), repository.name_with_owner.clone()));
+                Ok((
+                    loaded,
+                    resolved,
+                    prompt,
+                    context.repository_root,
+                    github_token,
+                    detached_github_auth,
+                ))
             })();
-            let (loaded, resolved, prompt, cwd) = match initialized {
-                Ok(initialized) => initialized,
-                Err(error) => {
-                    attempt
-                        .record_error(agentctl::capture::FailureKind::Configuration)
-                        .context("persisting PR review bootstrap failure")?;
-                    return Err(error);
-                }
-            };
+            let (loaded, resolved, prompt, cwd, github_token, detached_github_auth) =
+                match initialized {
+                    Ok(initialized) => initialized,
+                    Err(error) => {
+                        attempt
+                            .record_error(agentctl::capture::FailureKind::Configuration)
+                            .context("persisting PR review bootstrap failure")?;
+                        return Err(error);
+                    }
+                };
             for warning in &resolved.warnings {
                 eprintln!("warning: {warning}");
             }
@@ -215,6 +241,8 @@ fn main() -> Result<()> {
                 prompt,
                 cwd,
                 iterations: 1,
+                github_token,
+                detached_github_auth,
                 attempt,
             };
             if detach {
@@ -306,6 +334,8 @@ fn main() -> Result<()> {
                 prompt,
                 cwd,
                 iterations,
+                github_token: None,
+                detached_github_auth: None,
                 attempt,
             };
             if detach {

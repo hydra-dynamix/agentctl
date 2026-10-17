@@ -89,9 +89,26 @@ The merge-commit strategy preserves the PR's development commits and records a
 distinct landing event. The reviewer also checks that the PR description records
 all material changes so the repository's change history remains useful.
 
-The runner needs an authenticated `gh` installation and GitHub permissions to
-read pull requests, submit reviews, and enable auto-merge. Repository and PR
-content are treated as untrusted review material by the predefined policy.
+The runner needs GitHub permissions to read pull requests, submit reviews, and
+enable auto-merge. Ambient `gh` authentication works, or configure an
+organization-installed GitHub App once in the runner's home config:
+
+```toml
+[github_app]
+app_id_command = ["op-vault", "get", "AGENTCTL_GH_APP_ID", "--account", "production"]
+private_key_command = ["op-vault", "get", "AGENTCTL_GH_PRIVATE_KEY", "--account", "production"]
+```
+
+For every review, agentctl retrieves the credentials, signs a short-lived JWT,
+and mints an installation token scoped to the current repository. The token is
+provided to `gh` and the review agent as `GH_TOKEN`; it is not written to the
+prompt, logs, supervisor specification, or job record. GitHub App credential
+commands are accepted only from the machine-owned home config, never from an
+untrusted repository `agentctl.toml`. If `[github_app]` is absent, existing
+ambient `gh` authentication behavior is unchanged.
+
+Repository and PR content are treated as untrusted review material by the
+predefined policy.
 
 ## Wrap a noisy command
 

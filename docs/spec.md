@@ -116,6 +116,12 @@ command = ["pi", "--provider", "openrouter", "--model", "openrouter/auto", "--pr
 prompt_stdin = false
 ```
 
+The optional machine-owned `[github_app]` section configures `app_id_command`,
+`private_key_command`, and an optional `api_url`. `task pr-review` uses these to
+mint a short-lived installation token scoped to the current repository and
+passes it only through child-process environment. Repository-local config cannot
+override these credential commands. See `docs/github-app-auth-spec.md`.
+
 A provider can resolve its key from `api_key_env` or `api_key_command`. The key
 is never stored in job records or logs. OpenRouter uses its Chat Completions
 endpoint. Other provider clients remain external commands.

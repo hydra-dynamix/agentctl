@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Add `agentctl task pr-review`, an exact-commit GitHub PR audit with optional requirements, confidence-gated reviews, and protected merge-commit auto-merge.
+- Add machine-owned GitHub App credential commands so PR review automatically mints a current-repository installation token without per-repository secrets or persisted tokens.
 
 ## 0.1.5 - 2026-10-10
 

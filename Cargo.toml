@@ -20,6 +20,7 @@ semver = "1.0.26"
 sha2 = "0.10.9"
 toml = "0.8.23"
 ureq = { version = "2.12.1", features = ["json"] }
+jsonwebtoken = "9.3.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.186"

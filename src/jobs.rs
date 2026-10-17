@@ -11,20 +11,24 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::capture::{ExecutionAttempt, FailureKind};
-use crate::config::{AgentConfig, CONFIG_DIR, SummaryConfig};
+use crate::config::{AgentConfig, CONFIG_DIR, GitHubAppConfig, SummaryConfig};
 use crate::exec::{CaptureOptions, CapturedRun, ProcessOptions, format_command, run_captured_with};
 use crate::platform;
 #[cfg(not(windows))]
 use crate::process::spawn_detached;
 use crate::summary::{Summary, summarize, summarize_with_command};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentRunOptions {
     pub agent_name: String,
     pub agent: AgentConfig,
     pub prompt: String,
     pub cwd: PathBuf,
     pub iterations: u32,
+    /// A short-lived token supplied only to a foreground agent process.
+    pub github_token: Option<String>,
+    /// Configuration used by a detached supervisor to mint its own token.
+    pub detached_github_auth: Option<(GitHubAppConfig, String)>,
     pub attempt: ExecutionAttempt,
 }
 
@@ -89,7 +93,15 @@ struct SupervisorSpec {
     iterations: u32,
     exit_code_path: PathBuf,
     label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    github_auth: Option<DetachedGitHubAuth>,
     attempt: ExecutionAttempt,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DetachedGitHubAuth {
+    config: GitHubAppConfig,
+    repository: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -170,6 +182,13 @@ pub fn launch_detached_with_executable(
         iterations: options.iterations,
         exit_code_path: exit_code_path.clone(),
         label: options.agent_name.clone(),
+        github_auth: options
+            .detached_github_auth
+            .as_ref()
+            .map(|(config, repository)| DetachedGitHubAuth {
+                config: config.clone(),
+                repository: repository.clone(),
+            }),
         attempt: options.attempt.clone(),
     };
     fs::write(&supervisor_path, toml::to_string_pretty(&supervisor)?)
@@ -244,6 +263,11 @@ pub fn supervise(path: &Path) -> Result<i32> {
     // to start. Do not leave the transient spec on disk for completed jobs.
     let _ = fs::remove_file(path);
 
+    let github_token = spec
+        .github_auth
+        .as_ref()
+        .map(|auth| crate::github_app::installation_token(&auth.config, &auth.repository))
+        .transpose()?;
     let mut exit_code = 0;
     for iteration in 1..=spec.iterations {
         if spec.iterations > 1 {
@@ -265,6 +289,7 @@ pub fn supervise(path: &Path) -> Result<i32> {
             spec.prompt_stdin,
             iteration,
             spec.iterations,
+            github_token.as_deref(),
         );
         match run_captured_with(&spec.argv, &capture_options, &process_options) {
             Ok(run) => {
@@ -360,6 +385,7 @@ fn run_agent_once(
         options.agent.prompt_stdin,
         iteration,
         options.iterations,
+        options.github_token.as_deref(),
     );
     run_captured_with(&argv, &capture_options, &process_options)
 }
@@ -370,21 +396,28 @@ fn agent_process_options(
     prompt_stdin: bool,
     iteration: u32,
     iterations: u32,
+    github_token: Option<&str>,
 ) -> ProcessOptions {
+    let mut env = vec![
+        ("AGENTCTL_AGENT_PROMPT".into(), prompt.into()),
+        ("AGENTCTL_AGENT_CWD".into(), cwd.as_os_str().to_owned()),
+        (
+            "AGENTCTL_AGENT_ITERATION".into(),
+            iteration.to_string().into(),
+        ),
+        (
+            "AGENTCTL_AGENT_ITERATIONS".into(),
+            iterations.to_string().into(),
+        ),
+    ];
+    if let Some(token) = github_token {
+        env.push(("GH_TOKEN".into(), token.into()));
+        // Ensure a host GITHUB_TOKEN cannot take precedence in gh.
+        env.push(("GITHUB_TOKEN".into(), "".into()));
+    }
     ProcessOptions {
         cwd: Some(cwd.to_path_buf()),
-        env: vec![
-            ("AGENTCTL_AGENT_PROMPT".into(), prompt.into()),
-            ("AGENTCTL_AGENT_CWD".into(), cwd.as_os_str().to_owned()),
-            (
-                "AGENTCTL_AGENT_ITERATION".into(),
-                iteration.to_string().into(),
-            ),
-            (
-                "AGENTCTL_AGENT_ITERATIONS".into(),
-                iterations.to_string().into(),
-            ),
-        ],
+        env,
         stdin: prompt_stdin.then(|| prompt.as_bytes().to_vec()),
     }
 }
@@ -619,6 +652,38 @@ mod tests {
         assert_eq!(tail.len(), 2);
         assert!(tail[1].contains("last"));
         assert!(tail.iter().map(String::len).sum::<usize>() <= 16_386);
+    }
+
+    #[test]
+    fn github_token_is_forwarded_only_in_process_environment() {
+        let options = agent_process_options(
+            Path::new("/repo"),
+            "prompt",
+            true,
+            1,
+            1,
+            Some("secret-token"),
+        );
+        assert!(
+            options
+                .env
+                .iter()
+                .any(|(name, value)| { name == "GH_TOKEN" && value == "secret-token" })
+        );
+        let serialized = toml::to_string(&StoredJobRecord {
+            id: "job".to_owned(),
+            agent: "reviewer".to_owned(),
+            pid: 1,
+            started_at: 1,
+            command: "agent".to_owned(),
+            cwd: PathBuf::from("/repo"),
+            iterations: 1,
+            log_path: PathBuf::from("log"),
+            exit_code_path: PathBuf::from("exit"),
+            attempt: None,
+        })
+        .unwrap();
+        assert!(!serialized.contains("secret-token"));
     }
 
     #[test]

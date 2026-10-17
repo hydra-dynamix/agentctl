@@ -30,16 +30,14 @@ prompt_stdin = true
     executable(
         &bin.path().join("git"),
         &format!(
-            "#!/bin/sh\ncase \"$*\" in\n  'rev-parse --show-toplevel') printf '%s\\n' '{}' ;;\n  'rev-parse HEAD') echo abc123 ;;\n  *) exit 2 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$*\" in\n  'rev-parse --show-toplevel') printf '%s\\n' '{}' ;;\n  'rev-parse HEAD') echo abc123 ;;\n  'remote get-url origin') echo https://github.com/owner/project.git ;;\n  *) exit 2 ;;\nesac\n",
             project.path().display()
         ),
     );
     executable(
         &bin.path().join("gh"),
         r#"#!/bin/sh
-if [ "$1 $2 $3 $4" = "repo view --json nameWithOwner" ]; then
-  echo '{"nameWithOwner":"owner/project"}'
-elif [ "$1" = "api" ]; then
+if [ "$1" = "api" ]; then
   echo '[{"number":42,"html_url":"https://example.test/pull/42","title":"Feature","state":"open","head":{"sha":"abc123"}}]'
 else
   exit 2
@@ -100,16 +98,14 @@ prompt_stdin = true
     executable(
         &bin.path().join("git"),
         &format!(
-            "#!/bin/sh\ncase \"$*\" in\n  'rev-parse --show-toplevel') printf '%s\\n' '{}' ;;\n  'rev-parse HEAD') echo abc123 ;;\n  *) exit 2 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$*\" in\n  'rev-parse --show-toplevel') printf '%s\\n' '{}' ;;\n  'rev-parse HEAD') echo abc123 ;;\n  'remote get-url origin') echo https://github.com/owner/project.git ;;\n  *) exit 2 ;;\nesac\n",
             project.path().display()
         ),
     );
     executable(
         &bin.path().join("gh"),
         r#"#!/bin/sh
-if [ "$1" = "repo" ]; then
-  echo '{"nameWithOwner":"owner/project"}'
-elif [ "$1" = "api" ]; then
+if [ "$1" = "api" ]; then
   echo '[]'
 else
   exit 2

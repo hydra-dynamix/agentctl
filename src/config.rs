@@ -15,6 +15,8 @@ pub const CONFIG_FILE: &str = "config.toml";
 pub struct Config {
     #[serde(default)]
     pub summary: SummaryConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_app: Option<GitHubAppConfig>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -42,6 +44,14 @@ pub struct AgentConfig {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubAppConfig {
+    pub app_id_command: Vec<String>,
+    pub private_key_command: Vec<String>,
+    #[serde(default = "default_github_api_url")]
+    pub api_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +194,7 @@ impl Default for Config {
 
         Self {
             summary: SummaryConfig::default(),
+            github_app: None,
             providers,
             agents,
         }
@@ -208,9 +219,27 @@ pub fn load() -> Result<LoadedConfig> {
 
 pub fn load_from_dir(current_dir: &Path) -> Result<LoadedConfig> {
     let home = platform::home_dir()?;
-    let selected_path = preferred_config_path(current_dir, &home);
+    load_from_dir_with_home(current_dir, &home)
+}
+
+fn load_from_dir_with_home(current_dir: &Path, home: &Path) -> Result<LoadedConfig> {
+    let selected_path = preferred_config_path(current_dir, home);
     if selected_path.exists() {
-        return load_path(&selected_path);
+        let mut loaded = load_path(&selected_path)?;
+        let project_path = current_dir.join(PROJECT_CONFIG_FILE);
+        let home_path = home.join(CONFIG_DIR).join(CONFIG_FILE);
+        if selected_path == project_path {
+            // Credential retrieval is machine-owned configuration. Never let a
+            // repository checkout choose commands that expose runner secrets.
+            loaded.config.github_app = if home_path.exists() {
+                check_path(&home_path)?.github_app
+            } else {
+                None
+            };
+            validate(&loaded.config)
+                .with_context(|| format!("checking {}", loaded.path.display()))?;
+        }
+        return Ok(loaded);
     }
 
     Ok(LoadedConfig {
@@ -260,6 +289,10 @@ pub fn show() -> Result<String> {
     to_toml_string(&loaded.config)
 }
 
+fn default_github_api_url() -> String {
+    "https://api.github.com".to_owned()
+}
+
 pub fn validate(config: &Config) -> Result<()> {
     if config.summary.max_output_bytes == 0 {
         bail!("summary.max_output_bytes must be greater than zero");
@@ -274,6 +307,19 @@ pub fn validate(config: &Config) -> Result<()> {
         && command.is_empty()
     {
         bail!("summary.summarizer_command must not be empty when set");
+    }
+    if let Some(github_app) = &config.github_app {
+        for (name, command) in [
+            ("app_id_command", &github_app.app_id_command),
+            ("private_key_command", &github_app.private_key_command),
+        ] {
+            if command.is_empty() || command.iter().any(|part| part.trim().is_empty()) {
+                bail!("github_app.{name} must contain non-empty command arguments");
+            }
+        }
+        if github_app.api_url.trim().is_empty() {
+            bail!("github_app.api_url must not be empty");
+        }
     }
 
     for (name, provider) in &config.providers {
@@ -385,6 +431,37 @@ mod tests {
     }
 
     #[test]
+    fn project_cannot_override_machine_github_app_commands() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let project_path = project_dir.path().join(PROJECT_CONFIG_FILE);
+        let home_path = home_dir.path().join(CONFIG_DIR).join(CONFIG_FILE);
+        let project = Config {
+            github_app: Some(GitHubAppConfig {
+                app_id_command: vec!["untrusted".to_owned()],
+                private_key_command: vec!["untrusted".to_owned()],
+                api_url: default_github_api_url(),
+            }),
+            ..Config::default()
+        };
+        let home = Config {
+            github_app: Some(GitHubAppConfig {
+                app_id_command: vec!["machine-app-id".to_owned()],
+                private_key_command: vec!["machine-key".to_owned()],
+                api_url: default_github_api_url(),
+            }),
+            ..Config::default()
+        };
+        fs::create_dir_all(home_path.parent().unwrap()).unwrap();
+        fs::write(&project_path, to_toml_string(&project).unwrap()).unwrap();
+        fs::write(&home_path, to_toml_string(&home).unwrap()).unwrap();
+
+        let loaded = load_from_dir_with_home(project_dir.path(), home_dir.path()).unwrap();
+
+        assert_eq!(loaded.config.github_app, home.github_app);
+    }
+
+    #[test]
     fn invalid_config_is_rejected() {
         let config = Config {
             summary: SummaryConfig {
@@ -393,6 +470,7 @@ mod tests {
                 max_preview_lines: 12,
                 summarizer_command: None,
             },
+            github_app: None,
             providers: Config::default().providers,
             agents: BTreeMap::new(),
         };
