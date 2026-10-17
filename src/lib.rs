@@ -15,6 +15,7 @@ pub mod platform;
 mod process;
 pub mod provider;
 pub mod summary;
+pub mod task;
 #[cfg(windows)]
 pub mod windows_process;
 

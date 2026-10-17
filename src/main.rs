@@ -25,6 +25,11 @@ enum Command {
         #[arg(required = true, trailing_var_arg = true)]
         argv: Vec<String>,
     },
+    /// Launch a predefined agent task.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     Run {
         agent: Option<String>,
         #[arg(long, conflicts_with = "prompt_file")]
@@ -88,6 +93,26 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// Audit the open pull request whose head is the current commit.
+    PrReview {
+        #[arg(long)]
+        requirements: Option<PathBuf>,
+        #[arg(long, default_value_t = 90)]
+        confidence_threshold: u8,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        detach: bool,
+        #[arg(long)]
+        json: bool,
+        /// Do not use another LDGR-selected harness when the primary is unavailable.
+        #[arg(long)]
+        no_fallback: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ConfigCommand {
     Generate,
     Check,
@@ -136,6 +161,80 @@ fn main() -> Result<()> {
             }
 
             std::process::exit(run.exit_status.code().unwrap_or(1));
+        }
+        Command::Task {
+            command:
+                TaskCommand::PrReview {
+                    requirements,
+                    confidence_threshold,
+                    agent,
+                    detach,
+                    json,
+                    no_fallback,
+                },
+        } => {
+            let attempt = agentctl::capture::ExecutionAttempt::begin(Path::new("."), "pr-review")?;
+            let initialized = (|| -> Result<_> {
+                let context = agentctl::task::resolve_pull_request(Path::new("."))?;
+                let requirements = agentctl::task::read_requirements(requirements.as_deref())?;
+                let prompt = agentctl::task::pr_review_prompt(
+                    &context,
+                    requirements.as_ref(),
+                    confidence_threshold,
+                )?;
+                let loaded = agentctl::config::check().with_context(|| {
+                    "Agentctl configuration is invalid; run `agentctl discover` for recovery options"
+                })?;
+                let mut resolved =
+                    agentctl::discovery::resolve_agent(&loaded, agent.as_deref(), !no_fallback)?;
+                if resolved.name.starts_with("ldgr-loop") || resolved.name == "ldgr-summary" {
+                    agentctl::compatibility::negotiate(&context.repository_root).map_err(|error| {
+                        anyhow::Error::new(error).context(
+                            "LDGR launcher/Core compatibility negotiation failed before worker startup",
+                        )
+                    })?;
+                }
+                resolved.agent = materialize_provider_agent(resolved.agent, &loaded.path)?;
+                Ok((loaded, resolved, prompt, context.repository_root))
+            })();
+            let (loaded, resolved, prompt, cwd) = match initialized {
+                Ok(initialized) => initialized,
+                Err(error) => {
+                    attempt
+                        .record_error(agentctl::capture::FailureKind::Configuration)
+                        .context("persisting PR review bootstrap failure")?;
+                    return Err(error);
+                }
+            };
+            for warning in &resolved.warnings {
+                eprintln!("warning: {warning}");
+            }
+            let options = agentctl::jobs::AgentRunOptions {
+                agent_name: format!("{}-pr-review", resolved.name),
+                agent: resolved.agent,
+                prompt,
+                cwd,
+                iterations: 1,
+                attempt,
+            };
+            if detach {
+                let record = agentctl::jobs::launch_detached(&options)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&record)?);
+                } else {
+                    print_job_record(&record);
+                }
+            } else {
+                let reports = agentctl::jobs::run_foreground(&options, &loaded.config.summary)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&reports)?);
+                } else {
+                    for report in &reports {
+                        print_summary(&report.summary);
+                    }
+                }
+                std::process::exit(reports.last().map_or(0, |report| report.summary.exit_code));
+            }
         }
         Command::Run {
             agent,

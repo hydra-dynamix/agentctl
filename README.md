@@ -62,6 +62,37 @@ harness and prints the decision to stderr. Pass `--no-fallback` to disable that
 behavior. Failures list the detected platform, config source, selected
 harnesses, runnable alternatives, and repair commands.
 
+## Run a predefined PR review
+
+From a CI checkout of a pull request, launch the built-in audit policy against
+the open PR whose head exactly matches `HEAD`:
+
+```sh
+agentctl task pr-review \
+  --agent codex \
+  --requirements /absolute/path/to/requirements.md \
+  --detach \
+  --json
+```
+
+The requirements file is optional, must be an absolute path to a readable UTF-8
+regular file, and is embedded in the review prompt. The confidence threshold
+defaults to 90 and can be changed with `--confidence-threshold <0-100>`.
+
+The task resolves the repository and associated PR through `git` and `gh`, then
+pins the audit to the exact `HEAD` SHA. Blocking findings produce a
+request-changes review. A passing review below the confidence threshold produces
+a non-approving comment. At or above the threshold, the reviewer may approve and
+enable GitHub auto-merge using a merge commit, but only after rechecking that the
+PR head is unchanged. Required checks and branch protections are never bypassed.
+The merge-commit strategy preserves the PR's development commits and records a
+distinct landing event. The reviewer also checks that the PR description records
+all material changes so the repository's change history remains useful.
+
+The runner needs an authenticated `gh` installation and GitHub permissions to
+read pull requests, submit reviews, and enable auto-merge. Repository and PR
+content are treated as untrusted review material by the predefined policy.
+
 ## Wrap a noisy command
 
 Use `exec` when an agent wants to run a command but should receive only the

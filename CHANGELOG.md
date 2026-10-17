@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add `agentctl task pr-review`, an exact-commit GitHub PR audit with optional requirements, confidence-gated reviews, and protected merge-commit auto-merge.
+
 ## 0.1.5 - 2026-10-10
 
 - Add native OpenRouter-compatible Chat Completions profiles with environment or command-based API keys.

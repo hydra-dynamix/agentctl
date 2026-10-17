@@ -42,6 +42,15 @@ agentctl exec [--json] [--raw] [--label <name>] -- <command...>
     Exit code mirrors the child. --raw streams untouched output instead.
     Raw capture stored under the job directory either way.
 
+agentctl task pr-review [--requirements <absolute-path>]
+            [--confidence-threshold <0-100>] [--agent <profile>]
+            [--detach] [--json] [--no-fallback]
+    Resolve the open PR whose head exactly matches HEAD and launch the built-in
+    review policy. Blocking findings request changes; passing low-confidence
+    reviews comment without approval; passing reviews at or above the threshold
+    may approve and enable merge-commit auto-merge after revalidating the head.
+    See docs/pr-review-task-spec.md for the complete policy.
+
 agentctl run <agent> [--prompt <text> | --prompt-file <path>]
             [--detach] [--sandbox] [--iterations <n>] [--cwd <dir>] [--json]
     Launch a configured agent. Foreground: summarized report per iteration.
